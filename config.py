@@ -1,11 +1,8 @@
 """
 Configuration module for GWS Drive Migration
+Hardcoded version - no .env dependency
 """
-import os
 from pathlib import Path
-from dotenv import load_dotenv
-
-load_dotenv()
 
 class Config:
     """Configuration settings for Drive migration"""
@@ -20,41 +17,59 @@ class Config:
         'https://www.googleapis.com/auth/drive.readonly',
     ]
     
-    # Source Domain Configuration
-    SOURCE_DOMAIN = os.getenv('SOURCE_DOMAIN', 'dev.shivaami.in')
-    SOURCE_ADMIN_EMAIL = os.getenv('SOURCE_ADMIN_EMAIL', 'hemant@dev.shivaami.in')
-    SOURCE_CREDENTIALS_FILE = os.getenv('SOURCE_CREDENTIALS_FILE', 'source_credentials.json')
+    # ============================================================================
+    # SOURCE DOMAIN CONFIGURATION
+    # ============================================================================
+    SOURCE_DOMAIN = 'dev.shivaami.in'
+    SOURCE_ADMIN_EMAIL = 'hemant@dev.shivaami.in'
+    SOURCE_CREDENTIALS_FILE = 'source_credentials.json'
     
-    # Destination Domain Configuration
-    DEST_DOMAIN = os.getenv('DEST_DOMAIN', 'demo.shivaami.in')
-    DEST_ADMIN_EMAIL = os.getenv('DEST_ADMIN_EMAIL', 'developers@demo.shivaami.in')
-    DEST_CREDENTIALS_FILE = os.getenv('DEST_CREDENTIALS_FILE', 'dest_credentials.json')
+    # ============================================================================
+    # DESTINATION DOMAIN CONFIGURATION
+    # ============================================================================
+    DEST_DOMAIN = 'demo.shivaami.in'
+    DEST_ADMIN_EMAIL = 'developers@demo.shivaami.in'
+    DEST_CREDENTIALS_FILE = 'dest_credentials.json'
     
-    # Migration Settings
-    BATCH_SIZE = int(os.getenv('BATCH_SIZE', '10'))
-    MAX_WORKERS = int(os.getenv('MAX_WORKERS', '5'))
-    RETRY_ATTEMPTS = int(os.getenv('RETRY_ATTEMPTS', '3'))
-    RETRY_DELAY = int(os.getenv('RETRY_DELAY', '5'))
+    # ============================================================================
+    # MIGRATION SETTINGS
+    # ============================================================================
+    BATCH_SIZE = 10              # Files per batch
+    MAX_WORKERS = 5              # Parallel workers (adjust based on API quotas)
+    RETRY_ATTEMPTS = 3           # Retry failed operations
+    RETRY_DELAY = 5              # Seconds between retries
     
-    # File Settings
-    MAX_FILE_SIZE_MB = int(os.getenv('MAX_FILE_SIZE_MB', '5120'))  # 5GB default
-    EXCLUDED_MIME_TYPES = os.getenv('EXCLUDED_MIME_TYPES', '').split(',')
+    # ============================================================================
+    # FILE SETTINGS
+    # ============================================================================
+    MAX_FILE_SIZE_MB = 5120      # Skip files larger than this (5GB default)
+    EXCLUDED_MIME_TYPES = []     # Add MIME types to exclude if needed
     
-    # Logging
-    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-    LOG_FILE = os.getenv('LOG_FILE', 'migration.log')
+    # ============================================================================
+    # LOGGING
+    # ============================================================================
+    LOG_LEVEL = 'INFO'           # DEBUG, INFO, WARNING, ERROR
+    LOG_FILE = 'migration.log'
     
-    # Database/State Management
-    STATE_DB_FILE = os.getenv('STATE_DB_FILE', 'migration_state.db')
-    RESUME_ON_FAILURE = os.getenv('RESUME_ON_FAILURE', 'True').lower() == 'true'
+    # ============================================================================
+    # DATABASE/STATE MANAGEMENT
+    # ============================================================================
+    STATE_DB_FILE = 'migration_state.db'
+    RESUME_ON_FAILURE = True
     
-    # Output
-    REPORT_DIR = Path(os.getenv('REPORT_DIR', 'reports'))
+    # ============================================================================
+    # OUTPUT
+    # ============================================================================
+    REPORT_DIR = Path('reports')
     REPORT_DIR.mkdir(exist_ok=True)
     
     @classmethod
     def validate(cls):
         """Validate required configuration"""
+        print("\n" + "="*70)
+        print(" "*20 + "VALIDATING CONFIGURATION")
+        print("="*70)
+        
         required_vars = [
             ('SOURCE_DOMAIN', cls.SOURCE_DOMAIN),
             ('SOURCE_ADMIN_EMAIL', cls.SOURCE_ADMIN_EMAIL),
@@ -62,16 +77,81 @@ class Config:
             ('DEST_ADMIN_EMAIL', cls.DEST_ADMIN_EMAIL),
         ]
         
-        missing = [name for name, value in required_vars if not value or value.startswith('admin@')]
+        # Check for missing values
+        missing = []
+        print("\n📋 Required Configuration:")
+        for name, value in required_vars:
+            if not value:
+                missing.append(name)
+                print(f"   ✗ {name:<20} MISSING")
+            else:
+                print(f"   ✓ {name:<20} {value}")
         
         if missing:
             raise ValueError(f"Missing required configuration: {', '.join(missing)}")
         
         # Check credentials files exist
-        if not Path(cls.SOURCE_CREDENTIALS_FILE).exists():
+        print(f"\n🔑 Credentials Files:")
+        
+        source_creds_path = Path(cls.SOURCE_CREDENTIALS_FILE)
+        if source_creds_path.exists():
+            print(f"   ✓ Source:      {cls.SOURCE_CREDENTIALS_FILE}")
+        else:
+            print(f"   ✗ Source:      NOT FOUND ({cls.SOURCE_CREDENTIALS_FILE})")
             raise FileNotFoundError(f"Source credentials file not found: {cls.SOURCE_CREDENTIALS_FILE}")
         
-        if not Path(cls.DEST_CREDENTIALS_FILE).exists():
+        dest_creds_path = Path(cls.DEST_CREDENTIALS_FILE)
+        if dest_creds_path.exists():
+            print(f"   ✓ Destination: {cls.DEST_CREDENTIALS_FILE}")
+        else:
+            print(f"   ✗ Destination: NOT FOUND ({cls.DEST_CREDENTIALS_FILE})")
             raise FileNotFoundError(f"Destination credentials file not found: {cls.DEST_CREDENTIALS_FILE}")
         
+        print("\n" + "="*70)
+        print(" "*25 + "✓ Configuration Valid")
+        print("="*70 + "\n")
+        
         return True
+    
+    @classmethod
+    def print_config(cls):
+        """Print current configuration"""
+        print("\n" + "="*70)
+        print(" "*20 + "MIGRATION CONFIGURATION")
+        print("="*70)
+        
+        print(f"\n📤 SOURCE DOMAIN")
+        print(f"   Domain:      {cls.SOURCE_DOMAIN}")
+        print(f"   Admin:       {cls.SOURCE_ADMIN_EMAIL}")
+        print(f"   Credentials: {cls.SOURCE_CREDENTIALS_FILE}")
+        
+        print(f"\n📥 DESTINATION DOMAIN")
+        print(f"   Domain:      {cls.DEST_DOMAIN}")
+        print(f"   Admin:       {cls.DEST_ADMIN_EMAIL}")
+        print(f"   Credentials: {cls.DEST_CREDENTIALS_FILE}")
+        
+        print(f"\n⚙️  MIGRATION SETTINGS")
+        print(f"   Max Workers:     {cls.MAX_WORKERS} parallel threads")
+        print(f"   Batch Size:      {cls.BATCH_SIZE} files per batch")
+        print(f"   Retry Attempts:  {cls.RETRY_ATTEMPTS} times")
+        print(f"   Max File Size:   {cls.MAX_FILE_SIZE_MB} MB")
+        
+        print(f"\n📊 LOGGING & OUTPUT")
+        print(f"   Log Level:       {cls.LOG_LEVEL}")
+        print(f"   Log File:        {cls.LOG_FILE}")
+        print(f"   Report Dir:      {cls.REPORT_DIR}")
+        print(f"   State DB:        {cls.STATE_DB_FILE}")
+        print(f"   Resume on Fail:  {cls.RESUME_ON_FAILURE}")
+        
+        print("="*70 + "\n")
+
+
+# Auto-validate on import in development
+if __name__ == "__main__":
+    print("\n🧪 Testing Configuration...\n")
+    Config.print_config()
+    try:
+        Config.validate()
+        print("✅ Configuration test PASSED!\n")
+    except Exception as e:
+        print(f"\n❌ Configuration test FAILED: {e}\n")
