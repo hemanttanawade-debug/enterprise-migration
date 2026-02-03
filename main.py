@@ -1,5 +1,6 @@
 """
 Main application entry point for Google Workspace Drive Migration
+With Checkpoint System Integration
 """
 import argparse
 import sys
@@ -14,6 +15,10 @@ from migration_engine import MigrationEngine
 from state_manager import StateManager
 from logging_config import setup_logging, create_logger
 
+# Import checkpoint system - FIXED IMPORT
+from checkpoint_manager import CheckpointManager, MigrationStatus, CheckpointRecord
+
+
 logger = None
 
 
@@ -24,8 +29,14 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  # Full domain migration
+  # Full domain migration with checkpoints
   python main.py --mode full --max-workers 5
+  
+  # Resume from latest checkpoint
+  python main.py --mode resume
+  
+  # Resume from specific checkpoint
+  python main.py --mode resume --checkpoint-file migration_checkpoints/checkpoint.csv
   
   # Dry run (list users only)
   python main.py --mode dry-run
@@ -33,17 +44,21 @@ Examples:
   # Migrate specific users
   python main.py --mode custom --user-mapping users.csv
   
-  # Resume failed migration
-  python main.py --mode resume
-  
   # Generate report only
   python main.py --mode report
+  
+  # List all checkpoints
+  python main.py --mode checkpoint-list
+  
+  # Cleanup old checkpoints
+  python main.py --mode checkpoint-cleanup --cleanup-days 30
         '''
     )
     
     parser.add_argument(
         '--mode',
-        choices=['full', 'dry-run', 'custom', 'resume', 'report', 'validate'],
+        choices=['full', 'dry-run', 'custom', 'resume', 'report', 'validate', 
+                 'checkpoint-list', 'checkpoint-cleanup', 'checkpoint-report'],
         default='full',
         help='Migration mode'
     )
@@ -78,7 +93,26 @@ Examples:
     parser.add_argument(
         '--no-resume',
         action='store_true',
-        help='Start fresh migration (ignore previous state)'
+        help='Start fresh migration (ignore checkpoints and previous state)'
+    )
+    
+    parser.add_argument(
+        '--checkpoint-file',
+        type=str,
+        help='Specific checkpoint file to resume from'
+    )
+    
+    parser.add_argument(
+        '--no-checkpoint',
+        action='store_true',
+        help='Disable checkpoint system for this run'
+    )
+    
+    parser.add_argument(
+        '--cleanup-days',
+        type=int,
+        default=Config.CHECKPOINT_CLEANUP_DAYS,
+        help=f'Delete checkpoints older than N days (default: {Config.CHECKPOINT_CLEANUP_DAYS})'
     )
     
     parser.add_argument(
@@ -110,6 +144,133 @@ def validate_setup():
     except Exception as e:
         logger.error(f"✗ Configuration validation failed: {e}")
         return False
+
+
+def checkpoint_list_mode():
+    """List all available checkpoints"""
+    global logger
+    from checkpoint_utils import list_all_checkpoints
+    
+    logger.info("="*80)
+    logger.info("CHECKPOINT LIST")
+    logger.info("="*80)
+    
+    checkpoints = list_all_checkpoints(Config.CHECKPOINT_FOLDER)
+    
+    if not checkpoints:
+        logger.info("No checkpoints found")
+        return True
+    
+    logger.info(f"\nFound {len(checkpoints)} checkpoint(s):\n")
+    
+    for i, cp in enumerate(checkpoints, 1):
+        logger.info(f"{i}. {cp['filename']}")
+        logger.info(f"   Source: {cp['source_domain']} → Dest: {cp['dest_domain']}")
+        logger.info(f"   Modified: {cp['modified'].strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"   Size: {cp['size_mb']:.2f} MB")
+        logger.info("")
+    
+    logger.info("="*80)
+    return True
+
+
+def checkpoint_cleanup_mode(cleanup_days, dry_run=True):
+    """Cleanup old checkpoints"""
+    global logger
+    from checkpoint_utils import cleanup_old_checkpoints
+    
+    logger.info("="*80)
+    logger.info(f"CHECKPOINT CLEANUP ({'DRY RUN' if dry_run else 'LIVE'})")
+    logger.info("="*80)
+    
+    stats = cleanup_old_checkpoints(
+        Config.CHECKPOINT_FOLDER,
+        days_old=cleanup_days,
+        dry_run=dry_run
+    )
+    
+    logger.info(f"\nTotal checkpoints: {stats['total_checkpoints']}")
+    logger.info(f"To delete: {stats['to_delete']}")
+    logger.info(f"To keep: {stats['kept']}")
+    
+    if dry_run and stats.get('would_delete'):
+        logger.info("\nWould delete:")
+        for filename in stats['would_delete']:
+            logger.info(f"  - {filename}")
+        logger.info("\nRun with --no-dry-run to actually delete")
+    elif not dry_run and stats.get('deleted_files'):
+        logger.info("\nDeleted:")
+        for filename in stats['deleted_files']:
+            logger.info(f"  - {filename}")
+    
+    logger.info("="*80)
+    return True
+
+
+def checkpoint_report_mode(checkpoint_file=None):
+    """Generate report from checkpoint"""
+    global logger
+    from checkpoint_utils import generate_checkpoint_report
+    
+    if not checkpoint_file:
+        # Find latest checkpoint
+        checkpoint_file = CheckpointManager.find_latest_checkpoint(
+            Config.CHECKPOINT_FOLDER,
+            Config.SOURCE_DOMAIN,
+            Config.DEST_DOMAIN
+        )
+    
+    if not checkpoint_file or not Path(checkpoint_file).exists():
+        logger.error("No checkpoint file found")
+        return False
+    
+    logger.info(f"Generating report for: {checkpoint_file}")
+    generate_checkpoint_report(checkpoint_file)
+    
+    return True
+
+
+def initialize_checkpoint_manager(args):
+    """Initialize checkpoint manager based on mode and arguments"""
+    global logger
+    
+    # Check if checkpoints are disabled
+    if args.no_checkpoint or not Config.CHECKPOINT_ENABLED:
+        logger.info("Checkpoint system disabled")
+        return None
+    
+    # Determine checkpoint file
+    checkpoint_file = None
+    
+    if args.mode == 'resume':
+        if args.checkpoint_file:
+            # Use specific checkpoint
+            checkpoint_file = args.checkpoint_file
+            if not Path(checkpoint_file).exists():
+                logger.error(f"Checkpoint file not found: {checkpoint_file}")
+                return None
+        elif Config.CHECKPOINT_AUTO_RESUME:
+            # Find latest checkpoint
+            checkpoint_file = CheckpointManager.find_latest_checkpoint(
+                Config.CHECKPOINT_FOLDER,
+                Config.SOURCE_DOMAIN,
+                Config.DEST_DOMAIN
+            )
+            if not checkpoint_file:
+                logger.warning("No checkpoint found to resume from, starting fresh")
+    
+    # Initialize checkpoint manager
+    checkpoint_mgr = CheckpointManager(
+        source_domain=Config.SOURCE_DOMAIN,
+        dest_domain=Config.DEST_DOMAIN,
+        checkpoint_folder=Config.CHECKPOINT_FOLDER,
+        resume_from=checkpoint_file
+    )
+    
+    # Print summary
+    checkpoint_mgr.print_summary()
+    
+    return checkpoint_mgr
 
 
 def dry_run_mode(auth_manager):
@@ -160,13 +321,16 @@ def dry_run_mode(auth_manager):
     return user_mapping
 
 
-def custom_migration_mode(auth_manager, mapping_file, max_workers):
+def custom_migration_mode(auth_manager, mapping_file, max_workers, args):
     """Custom migration with user-provided mapping"""
     global logger
     logger.info("="*80)
     logger.info("CUSTOM MIGRATION MODE")
     logger.info(f"Mapping file: {mapping_file}")
     logger.info("="*80)
+    
+    # Initialize checkpoint manager
+    checkpoint_mgr = initialize_checkpoint_manager(args)
     
     # Get services
     source_services = auth_manager.get_source_services()
@@ -226,12 +390,13 @@ def custom_migration_mode(auth_manager, mapping_file, max_workers):
         source_drive_ops = DriveOperations(source_services['drive'])
         dest_drive_ops = DriveOperations(dest_services['drive'])
         
-        # Initialize migration engine
+        # Initialize migration engine with checkpoint manager
         migration_engine = MigrationEngine(
             source_drive_ops,
             dest_drive_ops,
             Config,
-            state_mgr
+            state_mgr,
+            checkpoint_manager=checkpoint_mgr
         )
         
         # Start migration run
@@ -241,7 +406,9 @@ def custom_migration_mode(auth_manager, mapping_file, max_workers):
             'total_users': len(verified_mapping),
             'max_workers': max_workers,
             'mode': 'custom',
-            'mapping_file': mapping_file
+            'mapping_file': mapping_file,
+            'checkpoint_enabled': checkpoint_mgr is not None,
+            'checkpoint_file': checkpoint_mgr.checkpoint_file if checkpoint_mgr else None
         })
         
         logger.info(f"Starting custom migration run ID: {run_id}")
@@ -257,6 +424,10 @@ def custom_migration_mode(auth_manager, mapping_file, max_workers):
             # Update state
             state_mgr.end_migration_run(run_id, 'completed', summary)
             
+            # Print checkpoint summary if enabled
+            if checkpoint_mgr:
+                checkpoint_mgr.print_summary()
+            
             logger.info("="*80)
             logger.info("CUSTOM MIGRATION COMPLETED")
             logger.info(f"Total Users: {summary['total_users']}")
@@ -264,6 +435,8 @@ def custom_migration_mode(auth_manager, mapping_file, max_workers):
             logger.info(f"Files Migrated: {summary['total_files_migrated']}")
             logger.info(f"Files Failed: {summary['total_files_failed']}")
             logger.info(f"Report: {report_file}")
+            if checkpoint_mgr:
+                logger.info(f"Checkpoint: {checkpoint_mgr.checkpoint_file}")
             logger.info("="*80)
             
             return True
@@ -271,12 +444,20 @@ def custom_migration_mode(auth_manager, mapping_file, max_workers):
         except Exception as e:
             logger.error(f"Custom migration failed: {e}", exc_info=True)
             state_mgr.end_migration_run(run_id, 'failed', {})
+            
+            # Print checkpoint summary even on failure
+            if checkpoint_mgr:
+                checkpoint_mgr.print_summary()
+            
             return False
 
 
 def full_migration_mode(auth_manager, max_workers, args):
-    """Full domain migration"""
+    """Full domain migration with checkpoint support"""
     global logger
+    
+    # Initialize checkpoint manager
+    checkpoint_mgr = initialize_checkpoint_manager(args)
     
     # Get services
     source_services = auth_manager.get_source_services()
@@ -317,12 +498,13 @@ def full_migration_mode(auth_manager, max_workers, args):
         source_drive_ops = DriveOperations(source_services['drive'])
         dest_drive_ops = DriveOperations(dest_services['drive'])
         
-        # Initialize migration engine
+        # Initialize migration engine with checkpoint manager
         migration_engine = MigrationEngine(
             source_drive_ops,
             dest_drive_ops,
             Config,
-            state_mgr
+            state_mgr,
+            checkpoint_manager=checkpoint_mgr
         )
         
         # Start migration run
@@ -330,7 +512,9 @@ def full_migration_mode(auth_manager, max_workers, args):
             'source_domain': Config.SOURCE_DOMAIN,
             'dest_domain': Config.DEST_DOMAIN,
             'total_users': len(user_mapping),
-            'max_workers': max_workers
+            'max_workers': max_workers,
+            'checkpoint_enabled': checkpoint_mgr is not None,
+            'checkpoint_file': checkpoint_mgr.checkpoint_file if checkpoint_mgr else None
         })
         
         logger.info(f"Starting migration run ID: {run_id}")
@@ -346,42 +530,57 @@ def full_migration_mode(auth_manager, max_workers, args):
             # Update state
             state_mgr.end_migration_run(run_id, 'completed', summary)
             
+            # Print checkpoint summary if enabled
+            if checkpoint_mgr:
+                checkpoint_mgr.print_summary()
+            
             logger.info(f"Migration completed! Report: {report_file}")
+            if checkpoint_mgr:
+                logger.info(f"Checkpoint: {checkpoint_mgr.checkpoint_file}")
+            
             return True
             
         except Exception as e:
             logger.error(f"Migration failed: {e}", exc_info=True)
             state_mgr.end_migration_run(run_id, 'failed', {})
+            
+            # Print checkpoint summary even on failure
+            if checkpoint_mgr:
+                checkpoint_mgr.print_summary()
+            
             return False
 
 
-def resume_migration_mode(auth_manager, max_workers):
-    """Resume failed migration"""
+def resume_migration_mode(auth_manager, max_workers, args):
+    """Resume migration from checkpoint"""
     global logger
-    logger.info("Resuming previous migration...")
+    logger.info("="*80)
+    logger.info("RESUME MODE - Continuing from checkpoint")
+    logger.info("="*80)
     
-    if not Path(Config.STATE_DB_FILE).exists():
-        logger.error("No previous migration state found!")
+    # Initialize checkpoint manager (will auto-find latest or use specified)
+    checkpoint_mgr = initialize_checkpoint_manager(args)
+    
+    if not checkpoint_mgr:
+        logger.error("No checkpoint found to resume from!")
+        logger.info("Use --checkpoint-file to specify a checkpoint, or start a new migration")
         return False
     
-    with StateManager(Config.STATE_DB_FILE) as state_mgr:
-        progress = state_mgr.get_overall_progress()
-        
-        logger.info(f"Previous progress:")
-        logger.info(f"  Completed users: {progress.get('completed_users', 0)}/{progress.get('total_users', 0)}")
-        logger.info(f"  Completed files: {progress.get('completed_files', 0)}/{progress.get('total_files', 0)}")
-        logger.info(f"  Failed files: {progress.get('failed_files', 0)}")
-        
-        # Reset failed files for retry
-        reset_count = state_mgr.reset_failed_files(max_attempts=3)
-        logger.info(f"Reset {reset_count} failed files for retry")
-        
-        # Continue with full migration
-        return full_migration_mode(auth_manager, max_workers, argparse.Namespace(
-            no_resume=False,
-            filter_suspended=True,
-            filter_archived=True
-        ))
+    if not checkpoint_mgr.is_resuming:
+        logger.warning("No previous checkpoint found, starting fresh migration")
+        return full_migration_mode(auth_manager, max_workers, args)
+    
+    # Get checkpoint summary
+    summary = checkpoint_mgr.get_checkpoint_summary()
+    
+    logger.info(f"Resuming from: {checkpoint_mgr.checkpoint_file}")
+    logger.info(f"Progress: {summary['completion_percentage']:.2f}% complete")
+    logger.info(f"Pending: {summary['status_breakdown']['pending']} items")
+    logger.info(f"Failed: {summary['status_breakdown']['failed']} items (will retry)")
+    logger.info(f"Done: {summary['status_breakdown']['done']} items (will skip)")
+    
+    # Continue with full migration (will use checkpoint)
+    return full_migration_mode(auth_manager, max_workers, args)
 
 
 def report_mode():
@@ -473,12 +672,27 @@ def main():
     setup_logging(args.log_level, str(log_file))
     logger = create_logger(__name__)
     
-    logger.info("Google Workspace Drive Migration Tool")
+    logger.info("="*80)
+    logger.info("Google Workspace Drive Migration Tool with Checkpoint System")
     logger.info(f"Mode: {args.mode}")
+    logger.info("="*80)
     
     # Validate setup
     if not validate_setup():
         sys.exit(1)
+    
+    # Handle checkpoint-only modes (no authentication needed)
+    if args.mode == 'checkpoint-list':
+        success = checkpoint_list_mode()
+        sys.exit(0 if success else 1)
+    
+    if args.mode == 'checkpoint-cleanup':
+        success = checkpoint_cleanup_mode(args.cleanup_days, dry_run=False)
+        sys.exit(0 if success else 1)
+    
+    if args.mode == 'checkpoint-report':
+        success = checkpoint_report_mode(args.checkpoint_file)
+        sys.exit(0 if success else 1)
     
     # Report mode doesn't need authentication
     if args.mode == 'report':
@@ -521,14 +735,14 @@ def main():
         success = full_migration_mode(auth_manager, args.max_workers, args)
     
     elif args.mode == 'resume':
-        success = resume_migration_mode(auth_manager, args.max_workers)
+        success = resume_migration_mode(auth_manager, args.max_workers, args)
     
     elif args.mode == 'custom':
         if not args.user_mapping or not Path(args.user_mapping).exists():
             logger.error("User mapping file required for custom mode!")
             sys.exit(1)
         
-        success = custom_migration_mode(auth_manager, args.user_mapping, args.max_workers)
+        success = custom_migration_mode(auth_manager, args.user_mapping, args.max_workers, args)
     
     sys.exit(0 if success else 1)
 

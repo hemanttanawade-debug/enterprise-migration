@@ -40,6 +40,18 @@ class Config:
     RETRY_DELAY = 5              # Seconds between retries
     
     # ============================================================================
+    # CHECKPOINT CONFIGURATION
+    # ============================================================================
+    CHECKPOINT_ENABLED = True                    # Enable checkpoint system
+    CHECKPOINT_FOLDER = './migration_checkpoints'  # Checkpoint storage folder
+    CHECKPOINT_AUTO_RESUME = True                # Auto-resume from latest checkpoint
+    CHECKPOINT_CLEANUP_DAYS = 30                 # Delete checkpoints older than N days
+    
+    # Retry configuration for failed items
+    MAX_RETRY_ATTEMPTS = 3                       # Maximum retries for failed items
+    RETRY_DELAY_SECONDS = 60                     # Delay before retrying failed items
+    
+    # ============================================================================
     # FILE SETTINGS
     # ============================================================================
     MAX_FILE_SIZE_MB = 5120      # Skip files larger than this (5GB default)
@@ -107,6 +119,18 @@ class Config:
             print(f"   ✗ Destination: NOT FOUND ({cls.DEST_CREDENTIALS_FILE})")
             raise FileNotFoundError(f"Destination credentials file not found: {cls.DEST_CREDENTIALS_FILE}")
         
+        # Create checkpoint folder if enabled
+        if cls.CHECKPOINT_ENABLED:
+            try:
+                Path(cls.CHECKPOINT_FOLDER).mkdir(parents=True, exist_ok=True)
+                print(f"\n💾 Checkpoint System:")
+                print(f"   ✓ Enabled:     {cls.CHECKPOINT_ENABLED}")
+                print(f"   ✓ Folder:      {cls.CHECKPOINT_FOLDER}")
+                print(f"   ✓ Auto-resume: {cls.CHECKPOINT_AUTO_RESUME}")
+            except Exception as e:
+                print(f"   ✗ Failed to create checkpoint folder: {e}")
+                raise
+        
         print("\n" + "="*70)
         print(" "*25 + "✓ Configuration Valid")
         print("="*70 + "\n")
@@ -135,6 +159,14 @@ class Config:
         print(f"   Batch Size:      {cls.BATCH_SIZE} files per batch")
         print(f"   Retry Attempts:  {cls.RETRY_ATTEMPTS} times")
         print(f"   Max File Size:   {cls.MAX_FILE_SIZE_MB} MB")
+        
+        print(f"\n💾 CHECKPOINT SYSTEM")
+        print(f"   Enabled:         {cls.CHECKPOINT_ENABLED}")
+        if cls.CHECKPOINT_ENABLED:
+            print(f"   Folder:          {cls.CHECKPOINT_FOLDER}")
+            print(f"   Auto-resume:     {cls.CHECKPOINT_AUTO_RESUME}")
+            print(f"   Cleanup Days:    {cls.CHECKPOINT_CLEANUP_DAYS}")
+            print(f"   Max Retries:     {cls.MAX_RETRY_ATTEMPTS}")
         
         print(f"\n📊 LOGGING & OUTPUT")
         print(f"   Log Level:       {cls.LOG_LEVEL}")
