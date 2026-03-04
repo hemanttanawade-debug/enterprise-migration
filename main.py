@@ -128,7 +128,7 @@ Examples:
         default=True,
         help='Filter out archived users (default: True)'
     )
-    
+
     return parser.parse_args()
 
 
@@ -552,7 +552,7 @@ def full_migration_mode(auth_manager, max_workers, args):
 
 
 def resume_migration_mode(auth_manager, max_workers, args):
-    """Resume migration from checkpoint"""
+    """Resume migration from checkpoint - FIXED to respect user mapping"""
     global logger
     logger.info("="*80)
     logger.info("RESUME MODE - Continuing from checkpoint")
@@ -579,8 +579,184 @@ def resume_migration_mode(auth_manager, max_workers, args):
     logger.info(f"Failed: {summary['status_breakdown']['failed']} items (will retry)")
     logger.info(f"Done: {summary['status_breakdown']['done']} items (will skip)")
     
-    # Continue with full migration (will use checkpoint)
-    return full_migration_mode(auth_manager, max_workers, args)
+    # ========================================================================
+    # NEW CODE: Check if user mapping file is provided
+    # ========================================================================
+    user_mapping = None
+    
+    if args.user_mapping:
+        # User wants to resume only specific users from the mapping file
+        logger.info("="*80)
+        logger.info(f"FILTERING CHECKPOINT BY USER MAPPING: {args.user_mapping}")
+        logger.info("="*80)
+        
+        # Get services for user manager
+        source_services = auth_manager.get_source_services()
+        dest_services = auth_manager.get_dest_services()
+        
+        # Initialize user manager
+        user_mgr = UserManager(
+            source_services['admin'],
+            dest_services['admin'],
+            Config.SOURCE_DOMAIN,
+            Config.DEST_DOMAIN
+        )
+        
+        # Load user mapping from CSV
+        logger.info(f"Loading user mapping from {args.user_mapping}")
+        user_mapping = user_mgr.import_user_mapping(args.user_mapping)
+        
+        if not user_mapping:
+            logger.error("No users found in mapping file!")
+            return False
+        
+        logger.info(f"Loaded {len(user_mapping)} users from mapping file")
+        
+        # CRITICAL: Filter checkpoint to only include these users
+        logger.info("Filtering checkpoint records by allowed users...")
+        
+        allowed_source_users = set(user_mapping.keys())
+        original_count = len(checkpoint_mgr._cache)
+        
+        # Filter the in-memory cache
+        filtered_cache = {}
+        for file_id, record in checkpoint_mgr._cache.items():
+            if record.source_user_email in allowed_source_users:
+                filtered_cache[file_id] = record
+        
+        # Update the cache with filtered records
+        checkpoint_mgr._cache = filtered_cache
+        
+        filtered_count = len(filtered_cache)
+        removed_count = original_count - filtered_count
+        
+        logger.info(f"✓ Checkpoint filtered:")
+        logger.info(f"  - Original records: {original_count}")
+        logger.info(f"  - Filtered records: {filtered_count}")
+        logger.info(f"  - Removed records: {removed_count}")
+        logger.info(f"  - Users to migrate: {len(user_mapping)}")
+        
+        # Show which users will be migrated
+        logger.info("\nUsers that will be migrated:")
+        for src, dst in user_mapping.items():
+            user_files = sum(1 for r in filtered_cache.values() if r.source_user_email == src)
+            logger.info(f"  • {src} -> {dst} ({user_files} files)")
+        
+        # Verify users exist
+        logger.info("\nVerifying users exist in both domains...")
+        verified_mapping = {}
+        
+        for source_email, dest_email in user_mapping.items():
+            # Verify source user
+            if not user_mgr.verify_user_exists(source_email, source_services['admin']):
+                logger.warning(f"Source user not found: {source_email} - Skipping")
+                continue
+            
+            # Verify destination user
+            if not user_mgr.verify_user_exists(dest_email, dest_services['admin']):
+                logger.warning(f"Destination user not found: {dest_email} - Skipping")
+                continue
+            
+            verified_mapping[source_email] = dest_email
+            logger.info(f"✓ Verified: {source_email} -> {dest_email}")
+        
+        if not verified_mapping:
+            logger.error("No valid user mappings found after verification!")
+            return False
+        
+        logger.info(f"\nProceeding with {len(verified_mapping)} verified users")
+        user_mapping = verified_mapping
+    
+    # ========================================================================
+    # END NEW CODE
+    # ========================================================================
+    
+    # If no user mapping provided, use all users from checkpoint (original behavior)
+    if not user_mapping:
+        logger.info("No user mapping filter - will resume all users from checkpoint")
+        return full_migration_mode(auth_manager, max_workers, args)
+    
+    # ========================================================================
+    # NEW CODE: Resume with filtered user mapping
+    # ========================================================================
+    
+    # Initialize state manager
+    state_db = Config.STATE_DB_FILE
+    
+    with StateManager(state_db) as state_mgr:
+        # Add users to state
+        for src, dst in user_mapping.items():
+            state_mgr.add_user(src, dst)
+        
+        # Get services
+        source_services = auth_manager.get_source_services()
+        dest_services = auth_manager.get_dest_services()
+        
+        # Initialize drive operations
+        source_drive_ops = DriveOperations(source_services['drive'])
+        dest_drive_ops = DriveOperations(dest_services['drive'])
+        
+        # Initialize migration engine with filtered checkpoint
+        migration_engine = MigrationEngine(
+            source_drive_ops,
+            dest_drive_ops,
+            Config,
+            state_mgr,
+            checkpoint_manager=checkpoint_mgr  # Already filtered above
+        )
+        
+        # Start migration run
+        run_id = state_mgr.start_migration_run({
+            'source_domain': Config.SOURCE_DOMAIN,
+            'dest_domain': Config.DEST_DOMAIN,
+            'total_users': len(user_mapping),
+            'max_workers': max_workers,
+            'mode': 'resume_filtered',
+            'checkpoint_enabled': True,
+            'checkpoint_file': checkpoint_mgr.checkpoint_file,
+            'user_mapping_file': args.user_mapping
+        })
+        
+        logger.info("="*80)
+        logger.info(f"Starting FILTERED resume migration run ID: {run_id}")
+        logger.info("="*80)
+        
+        # Execute migration
+        try:
+            summary = migration_engine.migrate_domain(user_mapping, max_workers)
+            
+            # Generate reports
+            report_file = Config.REPORT_DIR / f'resume_filtered_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
+            migration_engine.generate_report(summary, str(report_file))
+            
+            # Update state
+            state_mgr.end_migration_run(run_id, 'completed', summary)
+            
+            # Print checkpoint summary
+            if checkpoint_mgr:
+                checkpoint_mgr.print_summary()
+            
+            logger.info("="*80)
+            logger.info("FILTERED RESUME MIGRATION COMPLETED")
+            logger.info(f"Total Users: {summary['total_users']}")
+            logger.info(f"Completed Users: {summary['completed_users']}")
+            logger.info(f"Files Migrated: {summary['total_files_migrated']}")
+            logger.info(f"Files Failed: {summary['total_files_failed']}")
+            logger.info(f"Report: {report_file}")
+            logger.info(f"Checkpoint: {checkpoint_mgr.checkpoint_file}")
+            logger.info("="*80)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Filtered resume migration failed: {e}", exc_info=True)
+            state_mgr.end_migration_run(run_id, 'failed', {})
+            
+            # Print checkpoint summary even on failure
+            if checkpoint_mgr:
+                checkpoint_mgr.print_summary()
+            
+            return False
 
 
 def report_mode():

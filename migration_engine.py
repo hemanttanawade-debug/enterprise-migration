@@ -18,7 +18,7 @@ CRITICAL FIXES:
 6. IGNORING Apps Script, Forms, and Sites (non-migratable types)
 """
 import logging
-import time
+import time     
 import mimetypes
 import hashlib
 import io
@@ -44,7 +44,8 @@ class MigrationEngine:
     IGNORED_MIME_TYPES = {
         'application/vnd.google-apps.script',
         'application/vnd.google-apps.form',
-        'application/vnd.google-apps.site'
+        'application/vnd.google-apps.site',
+        'application/octet-stream'
     }
     
     # ENHANCED MIME type mappings with ALL Google Workspace types
@@ -303,7 +304,7 @@ class MigrationEngine:
         return summary
 
     def migrate_user(self, source_email: str, dest_email: str) -> Dict:
-        """Migrate single user with checkpoint support - DEBUG VERSION"""
+        """Migrate single user with checkpoint support - FIXED for resume"""
         
         # Add debug logging
         import sys
@@ -371,60 +372,182 @@ class MigrationEngine:
             dest_drive = dest_auth.get_drive_service(user_email=dest_email)
             debug_print("Step 3 COMPLETE: Dest authenticated")
             
-            # Get all files and folders
-            debug_print("Step 4: Fetching files from source Drive")
-            logger.info(f"Fetching files for {source_email}...")
-            source_files = self._get_all_user_owned_files(source_drive, source_email)
-            debug_print(f"Step 4 COMPLETE: Fetched {len(source_files)} items")
-            
-            if not source_files:
-                debug_print("No files found - completing migration")
-                logger.info(f"No files found for {source_email}")
-                user_result['status'] = 'completed'
-                user_result['accuracy_rate'] = 100.0
-                user_result['end_time'] = datetime.now().isoformat()
-                return user_result
-            
-            # Separate folders and files
-            debug_print("Step 5: Separating folders and files")
-            all_folders = [f for f in source_files if f['mimeType'] == 'application/vnd.google-apps.folder']
-            all_files = [f for f in source_files if f['mimeType'] != 'application/vnd.google-apps.folder']
-            
-            user_result['files_total'] = len(all_files)
-            user_result['folders_total'] = len(all_folders)
-            debug_print(f"Step 5 COMPLETE: {len(all_folders)} folders, {len(all_files)} files")
-            
-            # CHECKPOINT: Register ALL discovered items
+            # ====================================================================
+            # CRITICAL FIX: Check if user files already in checkpoint (RESUME MODE)
+            # ====================================================================
+            user_files_in_checkpoint = []
+            folders_already_created = False
+
             if self.checkpoint:
+                user_files_in_checkpoint = [
+                    record for record in self.checkpoint._cache.values()
+                    if record.source_user_email == source_email
+                ]
+                
+                if user_files_in_checkpoint:
+                    debug_print(f"⚡ RESUME MODE: Found {len(user_files_in_checkpoint)} files in checkpoint")
+                    
+                    # FIXED: Check if ANY folders exist in checkpoint (not just DONE ones)
+                    # If folders are in checkpoint at all, they were already processed
+                    folders_in_checkpoint = [
+                        record for record in user_files_in_checkpoint
+                        if record.mime_type == 'application/vnd.google-apps.folder'
+                    ]
+                    
+                    # A folder was "already created" if it has a dest_folder_id mapped
+                    folders_with_dest_id = [f for f in folders_in_checkpoint if f.dest_folder_id]
+                    
+                    folders_already_created = len(folders_with_dest_id) > 0
+                    
+                    debug_print(f"Folders in checkpoint: {len(folders_in_checkpoint)}, with dest_id: {len(folders_with_dest_id)}")
+                    debug_print(f"Folders already created: {folders_already_created}")
+
+            # ====================================================================
+            # CONDITIONAL: Only fetch files if NOT in checkpoint
+            # ====================================================================
+            if not user_files_in_checkpoint:
+                # FIRST RUN - Fetch from Drive
+                debug_print("Step 4: Fetching files from source Drive (FIRST RUN)")
+                logger.info(f"Fetching files for {source_email}...")
+                source_files = self._get_all_user_owned_files(source_drive, source_email)
+                debug_print(f"Step 4 COMPLETE: Fetched {len(source_files)} items")
+                
+                if not source_files:
+                    debug_print("No files found - completing migration")
+                    logger.info(f"No files found for {source_email}")
+                    user_result['status'] = 'completed'
+                    user_result['accuracy_rate'] = 100.0
+                    user_result['end_time'] = datetime.now().isoformat()
+                    return user_result
+                
+                # Separate folders and files
+                debug_print("Step 5: Separating folders and files")
+                all_folders = [f for f in source_files if f['mimeType'] == 'application/vnd.google-apps.folder']
+                all_files = [f for f in source_files if f['mimeType'] != 'application/vnd.google-apps.folder']
+                
+                user_result['files_total'] = len(all_files)
+                user_result['folders_total'] = len(all_folders)
+                debug_print(f"Step 5 COMPLETE: {len(all_folders)} folders, {len(all_files)} files")
+                
+                # Register to checkpoint
                 debug_print("Step 6: Registering items to checkpoint")
-                logger.info("Registering discovered items to checkpoint...")
-                all_items = all_folders + all_files
-                self.checkpoint.register_discovered_items(all_items, source_email, dest_email)
-                logger.info(f"Checkpoint registration complete: {len(all_items)} items")
-                debug_print("Step 6 COMPLETE: Checkpoint registered")
+                if self.checkpoint:
+                    logger.info("Registering discovered items to checkpoint...")
+                    all_items = all_folders + all_files
+                    self.checkpoint.register_discovered_items(all_items, source_email, dest_email)
+                    logger.info(f"Checkpoint registration complete: {len(all_items)} items")
+                    debug_print("Step 6 COMPLETE: Checkpoint registered")
+                
+                # Build folder structure
+                debug_print("Step 7: Building folder structure")
+                logger.info("Building folder structure...")
+                folder_mapping = self._build_folder_structure_with_hierarchy(
+                    all_folders, source_drive, dest_drive
+                )
+                
+                user_result['folders_created'] = len(folder_mapping)
+                user_result['folders_failed'] = user_result['folders_total'] - user_result['folders_created']
+                debug_print(f"Step 7 COMPLETE: {user_result['folders_created']} folders created")
+                
             else:
-                debug_print("Step 6 SKIPPED: No checkpoint enabled")
+                # ================================================================
+                # RESUME MODE: Use files from checkpoint
+                # ================================================================
+                debug_print(f"⚡ RESUME MODE: Using {len(user_files_in_checkpoint)} files from checkpoint")
+                
+                # Separate folders and files from checkpoint
+                folders_from_checkpoint = [
+                    record for record in user_files_in_checkpoint
+                    if record.mime_type == 'application/vnd.google-apps.folder'
+                ]
+                
+                files_from_checkpoint = [
+                    record for record in user_files_in_checkpoint
+                    if record.mime_type != 'application/vnd.google-apps.folder'
+                ]
+                
+                user_result['files_total'] = len(files_from_checkpoint)
+                user_result['folders_total'] = len(folders_from_checkpoint)
+                
+                debug_print(f"Checkpoint contains: {len(folders_from_checkpoint)} folders, {len(files_from_checkpoint)} files")
+                
+                # CONDITIONAL: Only create folders if not already created
+                if not folders_already_created and folders_from_checkpoint:
+                    debug_print("Step 7: Creating folder structure (first time)")
+                    logger.info("Building folder structure from checkpoint...")
+                    
+                    # Convert checkpoint records back to folder items
+                    all_folders = []
+                    for record in folders_from_checkpoint:
+                        folder_item = {
+                            'id': record.file_id,
+                            'name': record.file_name,
+                            'mimeType': record.mime_type,
+                            'parents': [record.parent_id] if record.parent_id else []
+                        }
+                        all_folders.append(folder_item)
+                    
+                    folder_mapping = self._build_folder_structure_with_hierarchy(
+                        all_folders, source_drive, dest_drive
+                    )
+                    
+                    user_result['folders_created'] = len(folder_mapping)
+                    user_result['folders_failed'] = user_result['folders_total'] - user_result['folders_created']
+                    debug_print(f"Step 7 COMPLETE: {len(folder_mapping)} folders created")
+                    
+                elif folders_already_created:
+                    debug_print("Step 7: SKIPPING folder creation (already created)")
+                    # Build folder_mapping from checkpoint - only folders that have dest_id
+                    folder_mapping = {}
+                    folders_needing_creation = []
+                    
+                    for record in folders_from_checkpoint:
+                        if record.dest_folder_id:
+                            # Already created - use existing mapping
+                            folder_mapping[record.file_id] = record.dest_folder_id
+                        else:
+                            # Was registered but never created (PENDING/FAILED) - needs creation
+                            folders_needing_creation.append({
+                                'id': record.file_id,
+                                'name': record.file_name,
+                                'mimeType': record.mime_type,
+                                'parents': [record.parent_id] if record.parent_id else []
+                            })
+                    
+                    debug_print(f"Step 7: Using {len(folder_mapping)} existing folders, creating {len(folders_needing_creation)} missing folders")
+                    
+                    # Create only the missing folders
+                    if folders_needing_creation:
+                        new_folder_mapping = self._build_folder_structure_with_hierarchy(
+                            folders_needing_creation, source_drive, dest_drive
+                        )
+                        folder_mapping.update(new_folder_mapping)
+                    
+                    user_result['folders_created'] = len(folder_mapping)
+                    debug_print(f"Step 7 COMPLETE: {len(folder_mapping)} total folders mapped")
+
+                else:
+                    debug_print("Step 7: SKIPPING (no folders)")
+                    folder_mapping = {}
+                # Convert checkpoint records to file items for migration loop
+                all_files = []
+                for record in files_from_checkpoint:
+                    file_item = {
+                        'id': record.file_id,
+                        'name': record.file_name,
+                        'mimeType': record.mime_type,
+                        'size': record.file_size,
+                        'parents': [record.parent_id] if record.parent_id else []
+                    }
+                    all_files.append(file_item)
             
-            # Build folder structure
-            debug_print("Step 7: Building folder structure")
-            logger.info("Building folder structure...")
-            folder_mapping = self._build_folder_structure_with_hierarchy(
-                all_folders, source_drive, dest_drive
-            )
-            
-            user_result['folders_created'] = len(folder_mapping)
-            user_result['folders_failed'] = user_result['folders_total'] - user_result['folders_created']
-            debug_print(f"Step 7 COMPLETE: {user_result['folders_created']} folders created")
-            
-            if user_result['folders_failed'] > 0:
-                user_result['warnings'].append(f"⚠ {user_result['folders_failed']} folders failed")
-            
-            # Migrate files
+            # ====================================================================
+            # MIGRATE FILES (same for both first run and resume)
+            # ====================================================================
             debug_print(f"Step 8: Starting file migration loop ({len(all_files)} files)")
             logger.info("Migrating files...")
             file_count = 0
             
-            # DISABLE progress bar for debugging
             for file_info in all_files:
                 file_id = file_info['id']
                 file_name = file_info['name']
@@ -486,7 +609,7 @@ class MigrationEngine:
                         user_result['files_migrated'] += 1
                         self.processed_files.add(file_signature)
                         
-                        # ✅ MIGRATE FILE PERMISSIONS
+                        # Migrate permissions
                         if dest_file_id:
                             try:
                                 debug_print(f"  - Attempting to migrate permissions for {file_name}")
@@ -500,7 +623,6 @@ class MigrationEngine:
                                 
                                 debug_print(f"  - Permission migration result: {perm_result}")
                                 
-                                # Track permission migration statistics
                                 migrated_count = perm_result.get('migrated', 0)
                                 external_count = perm_result.get('external', 0)
                                 failed_count = perm_result.get('failed', 0)
@@ -518,8 +640,7 @@ class MigrationEngine:
                             except Exception as perm_error:
                                 debug_print(f"  ✗ EXCEPTION migrating permissions: {perm_error}")
                                 logger.error(f"Failed to migrate permissions for {file_name}: {perm_error}", exc_info=True)
-                        else:
-                            debug_print(f"  ⚠ WARNING: No dest_file_id found, cannot migrate permissions")
+                        
                         debug_print(f"  ✓ SUCCESS: {file_name}")
                     else:
                         if self.checkpoint:
@@ -569,7 +690,8 @@ class MigrationEngine:
             })
             user_result['end_time'] = datetime.now().isoformat()
         
-        return user_result    
+        return user_result
+
     def _should_ignore_file(self, mime_type: str) -> bool:
         """Check if file should be ignored based on MIME type"""
         return mime_type in self.IGNORED_MIME_TYPES
@@ -1170,11 +1292,25 @@ class MigrationEngine:
     def _migrate_file_with_enhanced_retry(self, file_id: str, file_name: str, mime_type: str,
                                           file_size: int, dest_parent_id: Optional[str],
                                           source_drive, dest_drive, dest_email: str) -> Dict:
+        
+        #Add absolute timeout
+        operation_start_time = time.time()
+        ABSOLUTE_TIMEOUT = 1800  # 30 minutes maximum per file
         """Migrate file with ENHANCED retry logic for connection issues"""
         last_error = None
         error_type = 'unknown'
         
         for attempt in range(self.max_retries):
+            #Check timeout before each attempt
+            elapsed = time.time() - operation_start_time
+            if elapsed > ABSOLUTE_TIMEOUT:
+                logger.error(f"⏰ TIMEOUT: {file_name} exceeded {ABSOLUTE_TIMEOUT}s ({elapsed:.0f}s elapsed)")
+                return {
+                    'success': False,
+                    'error': f'Operation timeout after {elapsed:.0f} seconds',
+                    'error_type': 'absolute_timeout',
+                    'retry_attempts': attempt
+                }
             try:
                 if mime_type.startswith('application/vnd.google-apps.'):
                     result = self._migrate_google_workspace_file_safe(
@@ -1195,6 +1331,15 @@ class MigrationEngine:
                 else:
                     last_error = result.get('error', 'Migration failed')
                     error_type = result.get('error_type', 'migration_failed')
+
+                    #Don't retry non-retryable errors
+                    NON_RETRYABLE_ERRORS = [
+                        'not_exportable', 'unknown_mime_type', 'permission_denied',
+                        'not_found', 'export_restricted', 'invalid_mime_type'
+                    ]
+                    if error_type in NON_RETRYABLE_ERRORS:
+                        logger.warning(f"⚠️ Non-retryable error for {file_name}: {error_type}")
+                        break  # EXIT immediately - don't waste time retrying
                 
             except (socket.timeout, ConnectionResetError, ConnectionError, OSError) as e:
                 error_code = getattr(e, 'winerror', getattr(e, 'errno', 0))
@@ -1207,14 +1352,17 @@ class MigrationEngine:
                     error_type = 'connection_error'
                     last_error = f"Connection error: {str(e)}"
                 
+                #Explicit retry limit check
+
                 if attempt < self.max_retries - 1:
                     wait_time = self.retry_delay * (2 ** attempt)
-                    logger.warning(f"Connection error for {file_name}, retrying in {wait_time}s (attempt {attempt + 1}/{self.max_retries}): {last_error}")
+                    logger.warning(f"🔄 Retry {attempt + 1}/{self.max_retries} for {file_name} in {wait_time}s: {last_error}")
                     time.sleep(wait_time)
                     continue
                 else:
-                    logger.error(f"Failed after {self.max_retries} connection retry attempts: {file_name}")
-                    break
+                    # CRITICAL: We've exhausted retries
+                    logger.error(f"❌ EXHAUSTED retries for {file_name} after {self.max_retries} attempts")
+                    break  # EXIT retry loop
                 
             except HttpError as e:
                 status_code = e.resp.status
@@ -1239,15 +1387,20 @@ class MigrationEngine:
                     error_type = 'http_error'
                     last_error = f"HTTP {status_code}: {last_error}"
                 
+                # Retry server errors and rate limits
                 if status_code in [429, 500, 503]:
                     if attempt < self.max_retries - 1:
                         delay = self.retry_delay * (2 ** attempt) if self.exponential_backoff else self.retry_delay
-                        logger.warning(f"Retrying {file_name} in {delay}s (attempt {attempt + 1}/{self.max_retries})")
+                        logger.warning(f"🔄 Retrying {file_name} in {delay}s (HTTP {status_code})")
                         time.sleep(delay)
                         continue
-                
-                logger.error(f"Non-retryable error for {file_name}: {last_error}")
-                break
+                    else:
+                        logger.error(f"❌ EXHAUSTED retries for {file_name} (HTTP {status_code})")
+                        break
+            
+                # All other HTTP errors: don't retry
+                logger.error(f"❌ Non-retryable HTTP error for {file_name}: {last_error}")
+                break  # EXIT
             
             except Exception as e:
                 last_error = str(e)
@@ -1275,11 +1428,12 @@ class MigrationEngine:
                 break
         
         return {
-            'success': False,
-            'error': last_error if last_error else 'Max retries exceeded',
-            'error_type': error_type,
-            'retry_attempts': self.max_retries
-        }
+        'success': False,
+        'error': last_error if last_error else f'Failed after {self.max_retries} attempts',
+        'error_type': error_type,
+        'retry_attempts': self.max_retries,
+        'final_status': 'exhausted_all_retries'
+    }
     
     def _migrate_google_workspace_file_safe(self, file_id: str, file_name: str, mime_type: str,
                                            file_size: int, dest_parent_id: Optional[str],
@@ -1518,13 +1672,33 @@ class MigrationEngine:
             downloaded_content = file_buffer.read()
             
             if not downloaded_content or len(downloaded_content) == 0:
-                self.stats['empty_downloads'] += 1
-                return {
-                    'success': False,
-                    'error': 'Downloaded content is empty',
-                    'error_type': 'empty_download'
-                }
-            
+
+                if file_size == 0:
+                    # Legitimately empty file - create it
+                    logger.info(f"Creating empty file: {file_name}")
+                    file_metadata = {'name': file_name}
+                    if dest_parent_id:
+                        file_metadata['parents'] = [dest_parent_id]
+                    
+                    uploaded_file = dest_drive.files().create(
+                        body=file_metadata,
+                        fields='id,name',
+                        supportsAllDrives=True
+                    ).execute()
+                    
+                    return {
+                        'success': True,
+                        'method': 'empty_file_created',
+                        'dest_file_id': uploaded_file['id']
+                    }
+                else:
+                    # Expected data but got nothing
+                    self.stats['empty_downloads'] += 1
+                    return {
+                        'success': False,
+                        'error': f'Empty download (expected {file_size} bytes)',
+                        'error_type': 'empty_download'
+                    }
             actual_size = len(downloaded_content)
             logger.debug(f"Downloaded {file_name}: {self._format_bytes(actual_size)}")
             
