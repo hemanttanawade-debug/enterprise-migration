@@ -147,7 +147,94 @@ class GoogleAuthManager:
         if not self.creds:
             self.authenticate()
         return build('admin', 'directory_v1', credentials=self.creds)
-
+    
+    # ============================================================================
+    # GCS BUCKET AUTH
+    # ============================================================================
+    @staticmethod
+    def get_gcs_client(service_account_file: str = None):
+        """
+        Get an authenticated GCS client for staging bucket operations.
+ 
+        Uses the service account JSON key from config (Storage Object Admin role required).
+        Falls back to Application Default Credentials (ADC) if no key file is provided
+        or found — useful when running on GCE / Cloud Run where ADC is automatic.
+ 
+        Args:
+            service_account_file: Path to GCS service account JSON key.
+                                  Defaults to Config.GCS_SERVICE_ACCOUNT_FILE.
+ 
+        Returns:
+            google.cloud.storage.Client
+ 
+        Usage:
+            client = GoogleAuthManager.get_gcs_client()
+            bucket = client.bucket('hemant-bucket')
+            blob   = bucket.blob('migration-staging/user@domain.com/file_id')
+            blob.upload_from_filename('/tmp/localfile.pdf')
+            blob.delete()  # call after migration confirmed 100%
+        """
+        from google.cloud import storage
+ 
+        if service_account_file is None:
+            from config import Config
+            service_account_file = Config.GCS_SERVICE_ACCOUNT_FILE
+ 
+        sa_path = Path(service_account_file)
+        if sa_path.exists():
+            logger.info(f"GCS auth: using service account key → {service_account_file}")
+            return storage.Client.from_service_account_json(str(sa_path))
+        else:
+            # ADC fallback — works on GCE, Cloud Run, or if gcloud auth application-default login was run
+            logger.warning(
+                f"GCS service account file not found ({service_account_file}). "
+                f"Falling back to Application Default Credentials."
+            )
+            return storage.Client()
+ 
+    # ============================================================================
+    # CLOUD SQL AUTH
+    # ============================================================================
+    @staticmethod
+    def get_db_connection():
+        """
+        Get an authenticated Cloud SQL connection via mysql.connector (public IP + whitelist).
+ 
+        Reads all DB settings from Config. Your machine's IP must be added to:
+        GCP Console → Cloud SQL → your instance → Connections → Authorized Networks.
+ 
+        SSL is kept enabled — Cloud SQL enforces SSL by default.
+ 
+        Returns:
+            mysql.connector.connection.MySQLConnection
+ 
+        Usage:
+            conn   = GoogleAuthManager.get_db_connection()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute("SELECT * FROM migration_files WHERE status = 'pending'")
+            rows   = cursor.fetchall()
+            conn.close()
+        """
+        import mysql.connector
+        from config import Config
+ 
+        logger.info(f"Connecting to Cloud SQL: {Config.DB_HOST}:{Config.DB_PORT}/{Config.DB_NAME}")
+        try:
+            conn = mysql.connector.connect(
+                host=Config.DB_HOST,
+                port=Config.DB_PORT,
+                database=Config.DB_NAME,
+                user=Config.DB_USER,
+                password=Config.DB_PASSWORD,
+                connect_timeout=Config.DB_CONNECT_TIMEOUT,
+                ssl_disabled=False,
+            )
+            logger.info("✓ Cloud SQL connection established")
+            return conn
+        except mysql.connector.Error as e:
+            logger.error(f"Cloud SQL connection failed: {e}")
+            raise
+ 
 
 class DomainAuthManager:
     """Manages authentication for both source and destination domains"""

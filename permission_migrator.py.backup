@@ -82,60 +82,81 @@ class EnhancedPermissionsMigrator:
             if role == 'owner':
                 result['skipped'] += 1
                 result['details'].append({
-                    'original_email': email or '',      
-                    'target_email':   email or '',
-                    'type': perm_type, 'role': role,
-                    'classification': 'external_domain',
+                    'email': email,
+                    'role': role,
                     'status': 'skipped',
-                    'reason': 'Owner permission handled during file creation',
+                    'reason': 'Owner permission handled during file creation'
                 })
                 continue
-
             
             # RULE 4: Handle General Access - Anyone with link
             if perm_type == 'anyone':
                 success, error = self._create_permission(
                     dest_file_id, perm_type, role, None, None, False
                 )
-                status = 'success' if success else 'failed'
+                
                 if success:
                     result['migrated'] += 1
                     result['general_access'] += 1
                     result['classification']['general_access'] += 1
+                    result['details'].append({
+                        'type': 'anyone',
+                        'role': role,
+                        'classification': 'general_access',
+                        'status': 'success',
+                        'note': f'Anyone with link can {role}'
+                    })
+                    logger.debug(f"✓ Migrated general access: Anyone can {role}")
                 else:
                     result['failed'] += 1
-                result['details'].append({
-                    'original_email': '', 'target_email': '',
-                    'type': 'anyone', 'role': role,
-                    'classification': 'general_access',
-                    'status': status,
-                    'error': error or '',
-                    'note': f'Anyone with link can {role}',
-                })
+                    result['details'].append({
+                        'type': 'anyone',
+                        'role': role,
+                        'classification': 'general_access',
+                        'status': 'failed',
+                        'error': error
+                    })
+                    logger.warning(f"✗ Failed general access: {error}")
+                
                 time.sleep(0.1)
                 continue
             
             # RULE 4: Handle Domain-wide access
             if perm_type == 'domain' and domain:
+                # Map to destination domain if it's the source domain
                 target_domain = self.dest_domain if domain == self.source_domain else domain
+                
                 success, error = self._create_permission(
                     dest_file_id, perm_type, role, None, target_domain, False
                 )
-                status = 'success' if success else 'failed'
+                
                 if success:
                     result['migrated'] += 1
                     result['general_access'] += 1
                     result['classification']['general_access'] += 1
+                    result['details'].append({
+                        'type': 'domain',
+                        'original_domain': domain,
+                        'target_domain': target_domain,
+                        'role': role,
+                        'classification': 'general_access',
+                        'status': 'success',
+                        'note': f'Domain-wide access for {target_domain}'
+                    })
+                    logger.debug(f"✓ Migrated domain access: {target_domain} can {role}")
                 else:
                     result['failed'] += 1
-                result['details'].append({
-                    'original_email': '', 'target_email': '',
-                    'type': 'domain', 'role': role,
-                    'classification': 'general_access',
-                    'status': status,
-                    'error': error or '',
-                    'note': f'Domain-wide access for {target_domain}',
-                })
+                    result['details'].append({
+                        'type': 'domain',
+                        'original_domain': domain,
+                        'target_domain': target_domain,
+                        'role': role,
+                        'classification': 'general_access',
+                        'status': 'failed',
+                        'error': error
+                    })
+                    logger.warning(f"✗ Failed domain access: {error}")
+                
                 time.sleep(0.1)
                 continue
             
@@ -143,152 +164,120 @@ class EnhancedPermissionsMigrator:
             if not email or '@' not in email:
                 result['skipped'] += 1
                 result['details'].append({
-                    'original_email': '', 'target_email': '',
-                    'type': perm_type, 'role': role,
-                    'classification': 'external_domain',
+                    'type': perm_type,
+                    'role': role,
                     'status': 'skipped',
-                    'reason': 'No valid email address',
+                    'reason': 'No valid email address'
                 })
                 continue
-
+            
+            # Determine user classification
             user_domain = email.split('@')[1]
-            local_part  = email.split('@')[0]
-            is_internal = (user_domain == self.source_domain)
-
-            if shared_drive_mode:
-                # ── SHARED DRIVE MODE ─────────────────────────────────────────
-                if not is_internal:
-                    # External users: SKIP entirely — no migration, no error
-                    result['skipped'] += 1
-                    result['external_users'] += 1
-                    result['classification']['external_domain'] += 1
-                    result['details'].append({
-                        'original_email': email,
-                        'target_email':   email,
-                        'type': perm_type, 'role': role,
-                        'classification': 'external_domain',
-                        'status': 'skipped',
-                        'reason': 'External users not migrated in Shared Drive mode',
-                    })
-                    logger.debug(f"  [SD] Skipping external user: {email}")
-                    time.sleep(0.1)
-                    continue
-
-                # Internal user — map to dest domain and try
+            local_part = email.split('@')[0]
+            
+            if user_domain == self.source_domain:
+                # User from source domain - apply RULE 1 or RULE 3
                 dest_email = f"{local_part}@{self.dest_domain}"
-                success, error = self._create_permission(
+                
+                # Try destination domain first (RULE 3 attempt)
+                success_dest, error_dest = self._create_permission(
                     dest_file_id, perm_type, role, dest_email, None, True
                 )
-
-                if success:
+                
+                if success_dest:
+                    # RULE 3: User exists in both domains - migrated as internal
                     result['migrated'] += 1
                     result['internal_users'] += 1
                     result['classification']['internal_both_domains'] += 1
                     result['details'].append({
                         'original_email': email,
-                        'target_email':   dest_email,
-                        'type': perm_type, 'role': role,
+                        'target_email': dest_email,
+                        'role': role,
+                        'type': perm_type,
                         'classification': 'internal_both_domains',
                         'rule': 'RULE_3',
                         'status': 'success',
-                        'note': f'Mapped {email} → {dest_email}',
+                        'note': f'User exists in both domains, mapped to {self.dest_domain}'
                     })
-                    logger.debug(f"  [SD] ✓ Internal: {email} → {dest_email} ({role})")
+                    logger.debug(f"✓ [RULE 3] Internal user: {email} → {dest_email} ({role})")
                 else:
-                    # User not found at destination — log as failed, do NOT
-                    # fall back to keeping source email on a Shared Drive
-                    result['failed'] += 1
-                    result['classification']['internal_source_only'] += 1
-                    result['details'].append({
-                        'original_email': email,
-                        'target_email':   dest_email,
-                        'type': perm_type, 'role': role,
-                        'classification': 'internal_source_only',
-                        'rule': 'RULE_1',
-                        'status': 'failed',
-                        'error': f'User {dest_email} not identifiable at destination: {error}',
-                    })
-                    logger.warning(
-                        f"  [SD] ✗ Internal user {dest_email} not found "
-                        f"at destination — not migrated"
-                    )
-
-            else:
-                # ── MY DRIVE MODE (original 5-rule behaviour) ──────────────────
-                if is_internal:
-                    dest_email = f"{local_part}@{self.dest_domain}"
-                    success_dest, error_dest = self._create_permission(
-                        dest_file_id, perm_type, role, dest_email, None, True
-                    )
-                    if success_dest:
-                        result['migrated'] += 1
-                        result['internal_users'] += 1
-                        result['classification']['internal_both_domains'] += 1
-                        result['details'].append({
-                            'original_email': email, 'target_email': dest_email,
-                            'type': perm_type, 'role': role,
-                            'classification': 'internal_both_domains',
-                            'rule': 'RULE_3', 'status': 'success',
-                            'note': f'Mapped to {self.dest_domain}',
-                        })
-                        logger.debug(f"✓ [RULE 3] {email} → {dest_email} ({role})")
-                    else:
-                        success_ext, error_ext = self._create_permission(
-                            dest_file_id, perm_type, role, email, None, False
-                        )
-                        if success_ext:
-                            result['migrated'] += 1
-                            result['external_users'] += 1
-                            result['classification']['internal_source_only'] += 1
-                            result['details'].append({
-                                'original_email': email, 'target_email': email,
-                                'type': perm_type, 'role': role,
-                                'classification': 'internal_source_only',
-                                'rule': 'RULE_1', 'status': 'success',
-                                'note': f'Not in {self.dest_domain}, kept as external',
-                            })
-                            logger.debug(f"✓ [RULE 1] External (source-only): {email} ({role})")
-                        else:
-                            result['failed'] += 1
-                            result['classification']['internal_source_only'] += 1
-                            result['details'].append({
-                                'original_email': email, 'target_email': email,
-                                'type': perm_type, 'role': role,
-                                'classification': 'internal_source_only',
-                                'rule': 'RULE_1', 'status': 'failed',
-                                'error': f'Dest: {error_dest}, External: {error_ext}',
-                            })
-                            logger.warning(f"✗ [RULE 1] Failed: {email} - {error_ext}")
-                else:
-                    success, error = self._create_permission(
+                    # RULE 1: User NOT in destination - migrate as external with source email
+                    success_external, error_external = self._create_permission(
                         dest_file_id, perm_type, role, email, None, False
                     )
-                    if success:
+                    
+                    if success_external:
                         result['migrated'] += 1
                         result['external_users'] += 1
-                        result['classification']['external_domain'] += 1
+                        result['classification']['internal_source_only'] += 1
                         result['details'].append({
-                            'original_email': email, 'target_email': email,
-                            'type': perm_type, 'role': role,
-                            'classification': 'external_domain',
-                            'rule': 'RULE_2', 'status': 'success',
-                            'note': 'External user from different domain',
+                            'original_email': email,
+                            'target_email': email,  # Keep source domain
+                            'role': role,
+                            'type': perm_type,
+                            'classification': 'internal_source_only',
+                            'rule': 'RULE_1',
+                            'status': 'success',
+                            'note': f'User not found in {self.dest_domain}, kept as external collaborator'
                         })
-                        logger.debug(f"✓ [RULE 2] External: {email} ({role})")
+                        logger.debug(f"✓ [RULE 1] External (source-only): {email} ({role})")
                     else:
+                        # RULE 5: Never skip - mark as failed but attempted
                         result['failed'] += 1
-                        result['classification']['external_domain'] += 1
+                        result['classification']['internal_source_only'] += 1
                         result['details'].append({
-                            'original_email': email, 'target_email': email,
-                            'type': perm_type, 'role': role,
-                            'classification': 'external_domain',
-                            'rule': 'RULE_2', 'status': 'failed',
-                            'error': error or '',
+                            'original_email': email,
+                            'target_email': email,
+                            'role': role,
+                            'type': perm_type,
+                            'classification': 'internal_source_only',
+                            'rule': 'RULE_1',
+                            'status': 'failed',
+                            'error': f'Dest: {error_dest}, External: {error_external}',
+                            'note': 'Attempted both internal and external migration (RULE 5)'
                         })
-                        logger.warning(f"✗ [RULE 2] Failed external: {email} - {error}")
-
+                        logger.warning(f"✗ [RULE 1] Failed: {email} - {error_external}")
+                
+            else:
+                # RULE 2: External user (different domain) - migrate as-is
+                success, error = self._create_permission(
+                    dest_file_id, perm_type, role, email, None, False
+                )
+                
+                if success:
+                    result['migrated'] += 1
+                    result['external_users'] += 1
+                    result['classification']['external_domain'] += 1
+                    result['details'].append({
+                        'original_email': email,
+                        'target_email': email,
+                        'role': role,
+                        'type': perm_type,
+                        'classification': 'external_domain',
+                        'rule': 'RULE_2',
+                        'status': 'success',
+                        'note': 'External user from different domain'
+                    })
+                    logger.debug(f"✓ [RULE 2] External user: {email} ({role})")
+                else:
+                    result['failed'] += 1
+                    result['classification']['external_domain'] += 1
+                    result['details'].append({
+                        'original_email': email,
+                        'target_email': email,
+                        'role': role,
+                        'type': perm_type,
+                        'classification': 'external_domain',
+                        'rule': 'RULE_2',
+                        'status': 'failed',
+                        'error': error
+                    })
+                    logger.warning(f"✗ [RULE 2] Failed external: {email} - {error}")
+            
+            # Rate limiting to avoid API quota issues
             time.sleep(0.1)
-
+        
+        # Log comprehensive summary
         logger.info(
             f"Permission migration summary: {result['migrated']}/{result['total_permissions']} migrated | "
             f"Internal (both): {result['classification']['internal_both_domains']} | "
@@ -297,6 +286,7 @@ class EnhancedPermissionsMigrator:
             f"General: {result['general_access']} | "
             f"Failed: {result['failed']}"
         )
+        
         return result
     
     def _create_permission(self, file_id: str, perm_type: str, role: str, 

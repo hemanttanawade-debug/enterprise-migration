@@ -449,7 +449,7 @@ def full_migration_mode(auth_manager, args) -> bool:
     # ─────────────────────────────────────────────────────────────────────
 
     engine = _build_migration_engine(auth_manager, mgr, run_id)
-    
+
     try:
         summary = engine.migrate_domain(mapping, max_workers=args.max_workers)
 

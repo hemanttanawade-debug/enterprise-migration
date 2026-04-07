@@ -215,7 +215,7 @@ class MigrationEngine:
     def migrate_domain(
         self,
         user_mapping: Dict[str, str],
-        max_workers: int = 4,
+        max_workers: int = 5,
     ) -> Dict:
         """
         Migrate all users in parallel.
@@ -419,14 +419,12 @@ class MigrationEngine:
             user_result["folders_created"] = len(folder_mapping)
             user_result["folders_failed"]  = len(all_folders) - len(folder_mapping)
 
-            # ── Migrate files — Level 2 parallel ─────────────────────────────
-            files_done   = 0
+            # ── Migrate files ─────────────────────────────────────────────
+            files_done = 0
             files_failed = 0
             bytes_moved  = 0
 
-            # Pre-filter before submitting to executor
-            def _should_process(file_info):
-                """Returns (fid, fname, mime, fsize, pids) or None to skip."""
+            for file_info in all_files:
                 fid   = file_info.get("id") or file_info.get("file_id") or file_info.get("source_item_id")
                 fname = file_info.get("name") or file_info.get("file_name") or file_info.get("source_item_name", "")
                 mime  = file_info.get("mimeType") or file_info.get("mime_type", "")
@@ -435,114 +433,79 @@ class MigrationEngine:
                 if not pids and file_info.get("source_parent_id"):
                     pids = [file_info["source_parent_id"]]
 
+                # Skip ignored types
                 if mime in IGNORED_MIME_TYPES:
                     user_result["files_ignored"] += 1
                     self.sql_mgr.mark_ignored(self.run_id, fid, "Non-migratable MIME type")
-                    return None
+                    continue
 
+                # Resume check
                 should_skip, reason = self.sql_mgr.should_skip_item(fid)
                 if should_skip:
                     if reason == "Already migrated":
                         user_result["files_skipped"] += 1
                     else:
                         user_result["files_ignored"] += 1
-                    return None
+                    continue
 
+                # Duplicate guard
                 sig = (fid, fname, fsize)
                 if sig in self._processed:
                     user_result["files_skipped"] += 1
                     self.sql_mgr.mark_skipped(fid, "Duplicate in session")
-                    return None
+                    continue
 
-                return fid, fname, mime, fsize, pids
-
-            def _migrate_one(file_info):
-                """Worker function — runs in thread pool."""
-                parsed = _should_process(file_info)
-                if parsed is None:
-                    return None   # already handled above
-
-                fid, fname, mime, fsize, pids = parsed
-
+                # Mark in progress
                 self.sql_mgr.mark_in_progress(self.run_id, fid)
 
-                dest_parent = folder_mapping.get(pids[0]) if pids else None
+                # Resolve destination parent
+                dest_parent = None
+                if pids:
+                    dest_parent = folder_mapping.get(pids[0])
 
+                # ── Route: memory vs GCS ──────────────────────────────────
                 result = self._migrate_file_v3(
                     fid, fname, mime, fsize, dest_parent,
                     source_drive, dest_drive,
                 )
-                result["_fid"]    = fid
-                result["_fname"]  = fname
-                result["_fsize"]  = fsize
-                result["_sig"]    = (fid, fname, fsize)
-                result["_dest_parent"] = dest_parent
-                return result
 
-            parallel_files = getattr(self.config, "PARALLEL_FILES", 8)
+                if result["success"]:
+                    dest_id = result.get("dest_id")
+                    self.sql_mgr.mark_done(
+                        self.run_id, fid,
+                        dest_item_id=dest_id,
+                        dest_parent_id=dest_parent,
+                    )
+                    self._processed.add(sig)
+                    user_result["files_migrated"] += 1
+                    files_done  += 1
+                    bytes_moved += fsize
 
-            with ThreadPoolExecutor(max_workers=parallel_files) as file_executor:
-                futures = {
-                    file_executor.submit(_migrate_one, fi): fi
-                    for fi in all_files
-                }
-
-                for future in as_completed(futures):
-                    try:
-                        result = future.result()
-                    except Exception as exc:
-                        fi    = futures[future]
-                        fname = fi.get("name") or fi.get("file_name", "")
-                        logger.error(f"  File future error [{fname}]: {exc}", exc_info=True)
-                        user_result["files_failed"] += 1
-                        files_failed += 1
-                        continue
-
-                    if result is None:
-                        continue   # was skipped/ignored inside _migrate_one
-
-                    fid        = result["_fid"]
-                    fname      = result["_fname"]
-                    fsize      = result["_fsize"]
-                    sig        = result["_sig"]
-                    dest_parent = result["_dest_parent"]
-
-                    if result["success"]:
-                        dest_id = result.get("dest_id")
-                        self.sql_mgr.mark_done(
-                            self.run_id, fid,
-                            dest_item_id=dest_id,
-                            dest_parent_id=dest_parent,
+                    # Apply permissions (hybrid: fetch API → apply API → track SQL)
+                    if dest_id:
+                        perm_r = self._migrate_permissions_hybrid(
+                            fid, dest_id, fname, source_drive, dest_drive
                         )
-                        self._processed.add(sig)
-                        user_result["files_migrated"] += 1
-                        files_done  += 1
-                        bytes_moved += fsize
+                        user_result["collaborators_migrated"] += perm_r.get("migrated", 0)
+                        user_result["external_collaborators"] += perm_r.get("external", 0)
 
-                        if dest_id:
-                            perm_r = self._migrate_permissions_hybrid(
-                                fid, dest_id, fname, source_drive, dest_drive
-                            )
-                            user_result["collaborators_migrated"] += perm_r.get("migrated", 0)
-                            user_result["external_collaborators"] += perm_r.get("external", 0)
+                elif result.get("ignored"):
+                    user_result["files_ignored"] += 1
+                    self.sql_mgr.mark_ignored(self.run_id, fid, result.get("error", ""))
+                else:
+                    user_result["files_failed"] += 1
+                    files_failed += 1
+                    self.sql_mgr.mark_failed(
+                        self.run_id, fid, result.get("error", "Unknown")
+                    )
+                    user_result["errors"].append({
+                        "file":       fname,
+                        "file_id":    fid,
+                        "error":      result.get("error", ""),
+                        "error_type": result.get("error_type", ""),
+                        "user":       source_email,
+                    })
 
-                    elif result.get("ignored"):
-                        user_result["files_ignored"] += 1
-                        self.sql_mgr.mark_ignored(self.run_id, fid, result.get("error", ""))
-
-                    else:
-                        user_result["files_failed"] += 1
-                        files_failed += 1
-                        self.sql_mgr.mark_failed(
-                            self.run_id, fid, result.get("error", "Unknown")
-                        )
-                        user_result["errors"].append({
-                            "file":       fname,
-                            "file_id":    fid,
-                            "error":      result.get("error", ""),
-                            "error_type": result.get("error_type", ""),
-                            "user":       source_email,
-                        })
             # ── Finish user ───────────────────────────────────────────────
             total_attempted = (
                 user_result["files_total"]
@@ -714,33 +677,6 @@ class MigrationEngine:
             except HttpError as exc:
                 code = exc.resp.status
                 last_error = str(exc)
-
-                # HTTP 200 raised by googleapiclient on resumable upload completion —
-                # the upload actually succeeded; extract dest_id from response body
-                if code == 200:
-                    try:
-                        body = json.loads(exc.content.decode("utf-8"))
-                        dest_id = body.get("id")
-                        if dest_id:
-                            logger.debug(f"  [MEM] HTTP 200 false-error resolved → dest_id={dest_id}")
-                            self.stats["memory_routed"] += 1
-                            return {**empty, "success": True, "dest_id": dest_id}
-                    except Exception:
-                        pass
-                    # If we can't extract an id, treat as success without id
-                    logger.warning(f"  [MEM] HTTP 200 false-error, no id extractable [{file_name}]")
-                    self.stats["memory_routed"] += 1
-                    return {**empty, "success": True, "dest_id": None}
-
-                # Download-restricted file — skip gracefully, don't count as failure
-                if code == 403 and (
-                    "cannotDownload" in last_error
-                    or "This file cannot be downloaded" in last_error
-                    or "403" in last_error
-                ):
-                    logger.warning(f"  [MEM] Download restricted — skipping [{file_name}]")
-                    return {**empty, "ignored": True, "error": "Download restricted by policy"}
-
                 if code in (429, 500, 503) and attempt < self.max_retries - 1:
                     wait = wait_times[min(attempt, len(wait_times) - 1)]
                     logger.warning(f"  [MEM] HTTP {code}, retry in {wait}s [{file_name}]")
@@ -920,19 +856,6 @@ class MigrationEngine:
             except HttpError as exc:
                 err = str(exc)
                 code = exc.resp.status
-
-                # HTTP 200 false-error on resumable upload completion
-                if code == 200:
-                    try:
-                        body = json.loads(exc.content.decode("utf-8"))
-                        dest_id = body.get("id")
-                        if dest_id:
-                            self.stats["memory_routed"] += 1
-                            return {**empty, "success": True, "dest_id": dest_id}
-                    except Exception:
-                        pass
-                    self.stats["memory_routed"] += 1
-                    return {**empty, "success": True, "dest_id": None}
 
                 if "exportSizeLimitExceeded" in err and "fallback_mime" in type_info:
                     return self._migrate_workspace_fallback(
