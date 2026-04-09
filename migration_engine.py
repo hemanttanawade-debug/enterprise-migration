@@ -218,101 +218,101 @@ class MigrationEngine:
     # Public: migrate_domain
     # =========================================================================
 
-        def migrate_domain(
-            self,
-            user_mapping: Dict[str, str],
-            max_workers: int = RECOMMENDED_MAX_WORKERS,
-        ) -> Dict:
-            """
-            Migrate all users in parallel.
-    
-            FIX: Default max_workers reduced to 2 for 2-vCPU VM.
-            The bottleneck is network I/O to Google APIs + MySQL pool connections,
-            not CPU. More than 2 concurrent users thrashes the connection pool
-            without improving throughput.
-            """
-            # Clamp to recommended ceiling for this VM size
-            effective_workers = min(max_workers, RECOMMENDED_MAX_WORKERS)
-            if max_workers > RECOMMENDED_MAX_WORKERS:
-                logger.warning(
-                    f"max_workers={max_workers} requested but VM has 2 vCPUs. "
-                    f"Clamping to {RECOMMENDED_MAX_WORKERS} to avoid pool exhaustion."
-                )
-    
-            logger.info(
-                f"Starting domain migration: {len(user_mapping)} users, "
-                f"{effective_workers} workers | run_id={self.run_id}"
+    def migrate_domain(
+        self,
+        user_mapping: Dict[str, str],
+        max_workers: int = RECOMMENDED_MAX_WORKERS,
+    ) -> Dict:
+        """
+        Migrate all users in parallel.
+
+        FIX: Default max_workers reduced to 2 for 2-vCPU VM.
+        The bottleneck is network I/O to Google APIs + MySQL pool connections,
+        not CPU. More than 2 concurrent users thrashes the connection pool
+        without improving throughput.
+        """
+        # Clamp to recommended ceiling for this VM size
+        effective_workers = min(max_workers, RECOMMENDED_MAX_WORKERS)
+        if max_workers > RECOMMENDED_MAX_WORKERS:
+            logger.warning(
+                f"max_workers={max_workers} requested but VM has 2 vCPUs. "
+                f"Clamping to {RECOMMENDED_MAX_WORKERS} to avoid pool exhaustion."
             )
-            self.stats["start_time"] = datetime.now()
-    
-            summary = {
-                "total_users":                  len(user_mapping),
-                "completed_users":              0,
-                "failed_users":                 0,
-                "total_files_migrated":         0,
-                "total_files_failed":           0,
-                "total_files_skipped":          0,
-                "total_files_ignored":          0,
-                "total_folders_created":        0,
-                "total_folders_failed":         0,
-                "total_collaborators_migrated": 0,
-                "total_external_collaborators": 0,
-                "accuracy_rate":                0.0,
-                "user_results":                 [],
-                "start_time":                   self.stats["start_time"].isoformat(),
-                "end_time":                     None,
-                "detailed_failures":            [],
+
+        logger.info(
+            f"Starting domain migration: {len(user_mapping)} users, "
+            f"{effective_workers} workers | run_id={self.run_id}"
+        )
+        self.stats["start_time"] = datetime.now()
+
+        summary = {
+            "total_users":                  len(user_mapping),
+            "completed_users":              0,
+            "failed_users":                 0,
+            "total_files_migrated":         0,
+            "total_files_failed":           0,
+            "total_files_skipped":          0,
+            "total_files_ignored":          0,
+            "total_folders_created":        0,
+            "total_folders_failed":         0,
+            "total_collaborators_migrated": 0,
+            "total_external_collaborators": 0,
+            "accuracy_rate":                0.0,
+            "user_results":                 [],
+            "start_time":                   self.stats["start_time"].isoformat(),
+            "end_time":                     None,
+            "detailed_failures":            [],
+        }
+
+        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            futures = {
+                executor.submit(self.migrate_user, src, dst): (src, dst)
+                for src, dst in user_mapping.items()
             }
-    
-            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                futures = {
-                    executor.submit(self.migrate_user, src, dst): (src, dst)
-                    for src, dst in user_mapping.items()
-                }
-    
-                for future in as_completed(futures):
-                    src_email, dst_email = futures[future]
-                    try:
-                        user_result = future.result()
-                        summary["user_results"].append(user_result)
-    
-                        if user_result["status"] == "completed":
-                            summary["completed_users"] += 1
-                        else:
-                            summary["failed_users"] += 1
-    
-                        summary["total_files_migrated"]         += user_result["files_migrated"]
-                        summary["total_files_failed"]           += user_result["files_failed"]
-                        summary["total_files_skipped"]          += user_result["files_skipped"]
-                        summary["total_files_ignored"]          += user_result.get("files_ignored", 0)
-                        summary["total_folders_created"]        += user_result.get("folders_created", 0)
-                        summary["total_folders_failed"]         += user_result.get("folders_failed", 0)
-                        summary["total_collaborators_migrated"] += user_result.get("collaborators_migrated", 0)
-                        summary["total_external_collaborators"] += user_result.get("external_collaborators", 0)
-    
-                        if user_result.get("errors"):
-                            summary["detailed_failures"].extend(user_result["errors"])
-    
-                    except Exception as exc:
-                        logger.error(f"User migration failed {src_email}: {exc}", exc_info=True)
+
+            for future in as_completed(futures):
+                src_email, dst_email = futures[future]
+                try:
+                    user_result = future.result()
+                    summary["user_results"].append(user_result)
+
+                    if user_result["status"] == "completed":
+                        summary["completed_users"] += 1
+                    else:
                         summary["failed_users"] += 1
-    
-            total = summary["total_files_migrated"] + summary["total_files_failed"]
-            if total > 0:
-                summary["accuracy_rate"] = (summary["total_files_migrated"] / total) * 100
-    
-            self.stats["end_time"] = datetime.now()
-            summary["end_time"]         = self.stats["end_time"].isoformat()
-            summary["duration_seconds"] = (
-                self.stats["end_time"] - self.stats["start_time"]
-            ).total_seconds()
-    
-            logger.info(
-                f"Domain migration complete: {summary['accuracy_rate']:.2f}% accuracy | "
-                f"GCS routed: {self.stats['gcs_routed']} | "
-                f"Memory routed: {self.stats['memory_routed']}"
-            )
-            return summary
+
+                    summary["total_files_migrated"]         += user_result["files_migrated"]
+                    summary["total_files_failed"]           += user_result["files_failed"]
+                    summary["total_files_skipped"]          += user_result["files_skipped"]
+                    summary["total_files_ignored"]          += user_result.get("files_ignored", 0)
+                    summary["total_folders_created"]        += user_result.get("folders_created", 0)
+                    summary["total_folders_failed"]         += user_result.get("folders_failed", 0)
+                    summary["total_collaborators_migrated"] += user_result.get("collaborators_migrated", 0)
+                    summary["total_external_collaborators"] += user_result.get("external_collaborators", 0)
+
+                    if user_result.get("errors"):
+                        summary["detailed_failures"].extend(user_result["errors"])
+
+                except Exception as exc:
+                    logger.error(f"User migration failed {src_email}: {exc}", exc_info=True)
+                    summary["failed_users"] += 1
+
+        total = summary["total_files_migrated"] + summary["total_files_failed"]
+        if total > 0:
+            summary["accuracy_rate"] = (summary["total_files_migrated"] / total) * 100
+
+        self.stats["end_time"] = datetime.now()
+        summary["end_time"]         = self.stats["end_time"].isoformat()
+        summary["duration_seconds"] = (
+            self.stats["end_time"] - self.stats["start_time"]
+        ).total_seconds()
+
+        logger.info(
+            f"Domain migration complete: {summary['accuracy_rate']:.2f}% accuracy | "
+            f"GCS routed: {self.stats['gcs_routed']} | "
+            f"Memory routed: {self.stats['memory_routed']}"
+        )
+        return summary
 
     # =========================================================================
     # Public: migrate_user
