@@ -678,18 +678,21 @@ class MigrationEngine:
                     meta["parents"] = [dest_parent_id]
  
                 upload_buf = io.BytesIO(data)   # fresh buffer per attempt
+
+                use_resumable = len(data) >= 5 * 1024 * 1024   # 5 MB threshold
+
                 media = MediaIoBaseUpload(
                     upload_buf,
                     mimetype=mime_type,
-                    resumable=True,
-                    chunksize=20 * 1024 * 1024,
+                    resumable=use_resumable,
+                    chunksize=20 * 1024 * 1024 if use_resumable else -1,
                 )
                 f = dest_drive.files().create(
                     body=meta, media_body=media,
                     fields="id", supportsAllDrives=True,
                 ).execute()
                 upload_buf.close()
- 
+
                 self.stats["memory_routed"] += 1
                 return {**empty, "success": True, "dest_id": f["id"]}
  
@@ -947,18 +950,21 @@ class MigrationEngine:
  
                 # FIX 2: fresh BytesIO + MediaIoBaseUpload per attempt
                 upload_buf = io.BytesIO(data)
+
+                use_resumable = len(data) >= 5 * 1024 * 1024   # 5 MB threshold
+
                 media = MediaIoBaseUpload(
                     upload_buf,
                     mimetype=type_info["export_mime"],
-                    resumable=True,
-                    chunksize=10 * 1024 * 1024,
+                    resumable=use_resumable,
+                    chunksize=10 * 1024 * 1024 if use_resumable else -1,
                 )
                 f = dest_drive.files().create(
                     body=meta, media_body=media,
                     fields="id", supportsAllDrives=True,
                 ).execute()
                 upload_buf.close()
- 
+
                 self.stats["memory_routed"] += 1
                 return {**empty, "success": True, "dest_id": f["id"]}
  
@@ -1021,34 +1027,51 @@ class MigrationEngine:
                 fileId=file_id, mimeType=type_info["fallback_mime"]
             )
             dl_buf = io.BytesIO()
-            dl     = MediaIoBaseDownload(dl_buf, request, chunksize=10 * 1024 * 1024)
-            done   = False
-            while not done:
-                _, done = dl.next_chunk()
-            dl_buf.seek(0)
- 
+            try:
+                dl   = MediaIoBaseDownload(dl_buf, request, chunksize=10 * 1024 * 1024)
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+                dl_buf.seek(0)
+                data = dl_buf.read()
+            finally:
+                dl_buf.close()
+
+            if not data:
+                return {**empty, "error": "Empty fallback export", "error_type": "empty_export"}
+
             fallback_name = file_name + type_info["fallback_ext"]
             meta = {"name": fallback_name}
             if dest_parent_id:
                 meta["parents"] = [dest_parent_id]
- 
-            media = MediaIoBaseUpload(
-                dl_buf,
-                mimetype=type_info["fallback_mime"],
-                resumable=True,
-                chunksize=10 * 1024 * 1024,
-            )
-            f = dest_drive.files().create(
-                body=meta, media_body=media,
-                fields="id", supportsAllDrives=True,
-            ).execute()
- 
+
+            # Use non-resumable (multipart) upload for files under 5 MB.
+            # Resumable uploads maintain server-side session state that gets
+            # corrupted when multiple threads share an HTTP client object —
+            # causing Content-Range mismatch HTTP 400 errors.
+            # Non-resumable uploads are stateless and fully thread-safe.
+            use_resumable = len(data) >= 5 * 1024 * 1024  # 5 MB threshold
+
+            upload_buf = io.BytesIO(data)
+            try:
+                media = MediaIoBaseUpload(
+                    upload_buf,
+                    mimetype=type_info["fallback_mime"],
+                    resumable=use_resumable,
+                    chunksize=10 * 1024 * 1024 if use_resumable else -1,
+                )
+                f = dest_drive.files().create(
+                    body=meta, media_body=media,
+                    fields="id", supportsAllDrives=True,
+                ).execute()
+            finally:
+                upload_buf.close()
+
             logger.info(f"  [WS-FALLBACK] ✓ {fallback_name}")
             return {**empty, "success": True, "dest_id": f["id"]}
- 
+
         except Exception as exc:
             return {**empty, "error": str(exc), "error_type": "workspace_fallback_failed"}
-
     # =========================================================================
     # Permissions: hybrid model (fetch API → apply API → track SQL)
     # =========================================================================
