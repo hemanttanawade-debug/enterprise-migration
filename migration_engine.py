@@ -198,9 +198,7 @@ class MigrationEngine:
         self.retry_delay       = 3
         self.connection_timeout = 600
 
-        # Per-thread Drive service cache (keyed by email)
-        self._drive_cache: Dict[str, object] = {}
-        self._drive_cache_lock = threading.Lock()
+        self._thread_local = threading.local()
 
         self.stats = {
             "total_files":            0,
@@ -700,10 +698,12 @@ class MigrationEngine:
                 last_error = str(exc)
  
                 if code == 200:
-                    # Resumable upload completion false-error from googleapiclient
                     try:
                         body = json.loads(exc.content.decode("utf-8"))
-                        dest_id = body.get("id")
+                        # body could be a list or a dict
+                        if isinstance(body, list):
+                            body = body[0] if body else {}
+                        dest_id = body.get("id") if isinstance(body, dict) else None
                         if dest_id:
                             self.stats["memory_routed"] += 1
                             return {**empty, "success": True, "dest_id": dest_id}
@@ -926,13 +926,15 @@ class MigrationEngine:
                 )
                 # FIX 2: fresh buffer per attempt
                 dl_buf = io.BytesIO()
-                dl     = MediaIoBaseDownload(dl_buf, request, chunksize=10 * 1024 * 1024)
-                done   = False
-                while not done:
-                    _, done = dl.next_chunk()
-                dl_buf.seek(0)
-                data = dl_buf.read()
-                dl_buf.close()
+                try:
+                    dl   = MediaIoBaseDownload(dl_buf, request, chunksize=10 * 1024 * 1024)
+                    done = False
+                    while not done:
+                        _, done = dl.next_chunk()
+                    dl_buf.seek(0)
+                    data = dl_buf.read()
+                finally:
+                    dl_buf.close()
  
                 if not data:
                     return {**empty, "error": "Empty export", "error_type": "empty_export"}
@@ -967,7 +969,10 @@ class MigrationEngine:
                 if code == 200:
                     try:
                         body = json.loads(exc.content.decode("utf-8"))
-                        dest_id = body.get("id")
+                        # body could be a list or a dict
+                        if isinstance(body, list):
+                            body = body[0] if body else {}
+                        dest_id = body.get("id") if isinstance(body, dict) else None
                         if dest_id:
                             self.stats["memory_routed"] += 1
                             return {**empty, "success": True, "dest_id": dest_id}
@@ -1344,20 +1349,21 @@ class MigrationEngine:
     
     def _get_drive_service_cached(self, auth_obj, email: str):
         """
-        FIX 5: Cache Drive service per email to avoid re-authenticating
-        (which involves RSA signing + HTTP round-trip) on every file.
-        Thread-safe via lock.
+        Cache Drive service PER THREAD PER EMAIL.
+        Using a global cache caused MediaIoBaseUpload Content-Range
+        cross-contamination across threads (HTTP 400 errors).
+        Thread-local storage ensures each thread gets its own
+        httplib2.Http object inside the Drive service, so resumable
+        upload sessions never bleed between threads.
         """
-        with self._drive_cache_lock:
-            if email in self._drive_cache:
-                return self._drive_cache[email]
- 
-        svc = self._get_drive_service(auth_obj, email)
- 
-        with self._drive_cache_lock:
-            self._drive_cache[email] = svc
- 
-        return svc
+        if not hasattr(self._thread_local, 'drive_cache'):
+            self._thread_local.drive_cache = {}
+        
+        if email not in self._thread_local.drive_cache:
+            svc = self._get_drive_service(auth_obj, email)
+            self._thread_local.drive_cache[email] = svc
+        
+        return self._thread_local.drive_cache[email]
  
     def _get_drive_service(self, auth_obj, email: str):
         from googleapiclient.discovery import build
