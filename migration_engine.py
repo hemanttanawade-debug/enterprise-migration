@@ -44,6 +44,7 @@ import time
 import json
 import threading
 import hashlib
+import random
 import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -149,6 +150,14 @@ def _fmt_duration(seconds: float) -> str:
         return f"{seconds / 60:.1f}m"
     return f"{seconds / 3600:.2f}h"
 
+def _jitter(base_seconds: float, jitter_fraction: float = 0.25) -> float:
+    """
+    Return base_seconds ± up to jitter_fraction of base_seconds.
+    Prevents thundering-herd when many threads retry simultaneously.
+    Example: _jitter(4) → somewhere between 3.0 and 5.0 seconds.
+    """
+    jitter = base_seconds * jitter_fraction
+    return base_seconds + random.uniform(-jitter, jitter)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MigrationEngine
