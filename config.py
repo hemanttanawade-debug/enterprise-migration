@@ -35,8 +35,8 @@ class Config:
     # MIGRATION SETTINGS
     # ============================================================================
     BATCH_SIZE = 10              # Files per batch
-    MAX_WORKERS = 4             # Parallel workers (adjust based on API quotas)
-    PARALLEL_FILES = 8           # Level 2: parallel files per user
+    MAX_WORKERS = 2             # Parallel workers (adjust based on API quotas)
+    PARALLEL_FILES = 4           # Level 2: parallel files per user
     RETRY_ATTEMPTS = 3           # Retry failed operations
     RETRY_DELAY = 5              # Seconds between retries
     

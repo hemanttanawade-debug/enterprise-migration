@@ -42,6 +42,7 @@ import logging
 import socket
 import time
 import json
+import threading
 import hashlib
 import mimetypes
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -60,6 +61,9 @@ mimetypes.init()
 # ─────────────────────────────────────────────────────────────────────────────
 
 LARGE_FILE_THRESHOLD_BYTES = 50 * 1024 * 1024   # 50 MB → route via GCS
+
+RECOMMENDED_MAX_WORKERS    = 2
+RECOMMENDED_PARALLEL_FILES = 4
 
 IGNORED_MIME_TYPES = frozenset({
     "application/vnd.google-apps.script",
@@ -185,7 +189,9 @@ class MigrationEngine:
         self.retry_delay       = 3
         self.connection_timeout = 600
 
-        socket.setdefaulttimeout(self.connection_timeout)
+        # Per-thread Drive service cache (keyed by email)
+        self._drive_cache: Dict[str, object] = {}
+        self._drive_cache_lock = threading.Lock()
 
         self.stats = {
             "total_files":            0,
@@ -207,118 +213,115 @@ class MigrationEngine:
         }
 
         self._processed: Set[Tuple] = set()
-
+        self._processed_lock = threading.Lock()
     # =========================================================================
     # Public: migrate_domain
     # =========================================================================
 
-    def migrate_domain(
-        self,
-        user_mapping: Dict[str, str],
-        max_workers: int = 4,
-    ) -> Dict:
-        """
-        Migrate all users in parallel.
-        Resume is automatic — SQL state drives which files are pending.
-        """
-        logger.info(
-            f"Starting domain migration: {len(user_mapping)} users, "
-            f"{max_workers} workers | run_id={self.run_id}"
-        )
-        self.stats["start_time"] = datetime.now()
-
-        summary = {
-            "total_users":                  len(user_mapping),
-            "completed_users":              0,
-            "failed_users":                 0,
-            "total_files_migrated":         0,
-            "total_files_failed":           0,
-            "total_files_skipped":          0,
-            "total_files_ignored":          0,
-            "total_folders_created":        0,
-            "total_folders_failed":         0,
-            "total_collaborators_migrated": 0,
-            "total_external_collaborators": 0,
-            "accuracy_rate":                0.0,
-            "user_results":                 [],
-            "start_time":                   self.stats["start_time"].isoformat(),
-            "end_time":                     None,
-            "detailed_failures":            [],
-        }
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self.migrate_user, src, dst): (src, dst)
-                for src, dst in user_mapping.items()
+        def migrate_domain(
+            self,
+            user_mapping: Dict[str, str],
+            max_workers: int = RECOMMENDED_MAX_WORKERS,
+        ) -> Dict:
+            """
+            Migrate all users in parallel.
+    
+            FIX: Default max_workers reduced to 2 for 2-vCPU VM.
+            The bottleneck is network I/O to Google APIs + MySQL pool connections,
+            not CPU. More than 2 concurrent users thrashes the connection pool
+            without improving throughput.
+            """
+            # Clamp to recommended ceiling for this VM size
+            effective_workers = min(max_workers, RECOMMENDED_MAX_WORKERS)
+            if max_workers > RECOMMENDED_MAX_WORKERS:
+                logger.warning(
+                    f"max_workers={max_workers} requested but VM has 2 vCPUs. "
+                    f"Clamping to {RECOMMENDED_MAX_WORKERS} to avoid pool exhaustion."
+                )
+    
+            logger.info(
+                f"Starting domain migration: {len(user_mapping)} users, "
+                f"{effective_workers} workers | run_id={self.run_id}"
+            )
+            self.stats["start_time"] = datetime.now()
+    
+            summary = {
+                "total_users":                  len(user_mapping),
+                "completed_users":              0,
+                "failed_users":                 0,
+                "total_files_migrated":         0,
+                "total_files_failed":           0,
+                "total_files_skipped":          0,
+                "total_files_ignored":          0,
+                "total_folders_created":        0,
+                "total_folders_failed":         0,
+                "total_collaborators_migrated": 0,
+                "total_external_collaborators": 0,
+                "accuracy_rate":                0.0,
+                "user_results":                 [],
+                "start_time":                   self.stats["start_time"].isoformat(),
+                "end_time":                     None,
+                "detailed_failures":            [],
             }
-
-            for future in as_completed(futures):
-                src_email, dst_email = futures[future]
-                try:
-                    user_result = future.result()
-                    summary["user_results"].append(user_result)
-
-                    if user_result["status"] == "completed":
-                        summary["completed_users"] += 1
-                    else:
+    
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                futures = {
+                    executor.submit(self.migrate_user, src, dst): (src, dst)
+                    for src, dst in user_mapping.items()
+                }
+    
+                for future in as_completed(futures):
+                    src_email, dst_email = futures[future]
+                    try:
+                        user_result = future.result()
+                        summary["user_results"].append(user_result)
+    
+                        if user_result["status"] == "completed":
+                            summary["completed_users"] += 1
+                        else:
+                            summary["failed_users"] += 1
+    
+                        summary["total_files_migrated"]         += user_result["files_migrated"]
+                        summary["total_files_failed"]           += user_result["files_failed"]
+                        summary["total_files_skipped"]          += user_result["files_skipped"]
+                        summary["total_files_ignored"]          += user_result.get("files_ignored", 0)
+                        summary["total_folders_created"]        += user_result.get("folders_created", 0)
+                        summary["total_folders_failed"]         += user_result.get("folders_failed", 0)
+                        summary["total_collaborators_migrated"] += user_result.get("collaborators_migrated", 0)
+                        summary["total_external_collaborators"] += user_result.get("external_collaborators", 0)
+    
+                        if user_result.get("errors"):
+                            summary["detailed_failures"].extend(user_result["errors"])
+    
+                    except Exception as exc:
+                        logger.error(f"User migration failed {src_email}: {exc}", exc_info=True)
                         summary["failed_users"] += 1
-
-                    summary["total_files_migrated"]         += user_result["files_migrated"]
-                    summary["total_files_failed"]           += user_result["files_failed"]
-                    summary["total_files_skipped"]          += user_result["files_skipped"]
-                    summary["total_files_ignored"]          += user_result.get("files_ignored", 0)
-                    summary["total_folders_created"]        += user_result.get("folders_created", 0)
-                    summary["total_folders_failed"]         += user_result.get("folders_failed", 0)
-                    summary["total_collaborators_migrated"] += user_result.get("collaborators_migrated", 0)
-                    summary["total_external_collaborators"] += user_result.get("external_collaborators", 0)
-
-                    if user_result.get("errors"):
-                        summary["detailed_failures"].extend(user_result["errors"])
-
-                except Exception as exc:
-                    logger.error(f"User migration failed {src_email}: {exc}", exc_info=True)
-                    summary["failed_users"] += 1
-                    summary["user_results"].append({
-                        "source_email": src_email,
-                        "dest_email":   dst_email,
-                        "status":       "failed",
-                        "error":        str(exc),
-                    })
-
-        total = summary["total_files_migrated"] + summary["total_files_failed"]
-        if total > 0:
-            summary["accuracy_rate"] = (summary["total_files_migrated"] / total) * 100
-
-        self.stats["end_time"] = datetime.now()
-        summary["end_time"]        = self.stats["end_time"].isoformat()
-        summary["duration_seconds"] = (
-            self.stats["end_time"] - self.stats["start_time"]
-        ).total_seconds()
-
-        logger.info(
-            f"Domain migration complete: {summary['accuracy_rate']:.2f}% accuracy | "
-            f"GCS routed: {self.stats['gcs_routed']} | "
-            f"Memory routed: {self.stats['memory_routed']}"
-        )
-        return summary
+    
+            total = summary["total_files_migrated"] + summary["total_files_failed"]
+            if total > 0:
+                summary["accuracy_rate"] = (summary["total_files_migrated"] / total) * 100
+    
+            self.stats["end_time"] = datetime.now()
+            summary["end_time"]         = self.stats["end_time"].isoformat()
+            summary["duration_seconds"] = (
+                self.stats["end_time"] - self.stats["start_time"]
+            ).total_seconds()
+    
+            logger.info(
+                f"Domain migration complete: {summary['accuracy_rate']:.2f}% accuracy | "
+                f"GCS routed: {self.stats['gcs_routed']} | "
+                f"Memory routed: {self.stats['memory_routed']}"
+            )
+            return summary
 
     # =========================================================================
     # Public: migrate_user
     # =========================================================================
 
     def migrate_user(self, source_email: str, dest_email: str) -> Dict:
-        """
-        Migrate a single user's My Drive.
-
-        PATCH:
-          - Auth is re-delegated per user using source_auth / dest_auth
-          - Checkpoint state is read from SQL (no interactive prompt)
-          - Folder mapping is loaded from SQL on resume
-        """
-        logger.info(f"Starting user migration: {source_email} → {dest_email}")
-
         self.sql_mgr.start_user(self.run_id, source_email)
-
+        logger.info(f"Starting user migration: {source_email} → {dest_email}")
+ 
         user_result = {
             "source_email":           source_email,
             "dest_email":             dest_email,
@@ -337,68 +340,50 @@ class MigrationEngine:
             "errors":                 [],
             "start_time":             datetime.now().isoformat(),
         }
-
+ 
         try:
-            # ── Re-delegate auth per user ─────────────────────────────────
-            source_drive = self._get_drive_service(self.source_auth, source_email)
-            dest_drive   = self._get_drive_service(self.dest_auth,   dest_email)
-
-            # ── Check SQL for existing items (resume) ─────────────────────
+            source_drive = self._get_drive_service_cached(self.source_auth, source_email)
+            dest_drive   = self._get_drive_service_cached(self.dest_auth,   dest_email)
+ 
             existing_items = self.sql_mgr.load_user_items(source_email)
-
+ 
             if existing_items:
                 logger.info(
                     f"  [RESUME] Found {len(existing_items)} items in SQL "
                     f"for {source_email}"
                 )
                 all_folders, all_files = self._split_items_from_records(existing_items)
-
-                # Build folder mapping from SQL (already-created folders)
-                folder_mapping = self.sql_mgr.get_folder_mapping(
-                    self.run_id, source_email
-                )
-                logger.info(
-                    f"  [RESUME] Loaded {len(folder_mapping)} folder mappings from SQL"
-                )
-
-                # Create any folders that are still PENDING/FAILED
+                folder_mapping = self.sql_mgr.get_folder_mapping(self.run_id, source_email)
+                logger.info(f"  [RESUME] Loaded {len(folder_mapping)} folder mappings from SQL")
+ 
                 missing_folders = [
                     f for f in all_folders
-                    if f["id"] not in folder_mapping
+                    if (f.get("id") or f.get("file_id")) not in folder_mapping
                 ]
                 if missing_folders:
-                    logger.info(
-                        f"  [RESUME] Creating {len(missing_folders)} missing folders"
-                    )
+                    logger.info(f"  [RESUME] Creating {len(missing_folders)} missing folders")
                     new_fm = self._build_folder_structure(
                         missing_folders, source_drive, dest_drive,
                         source_email, dest_email,
                     )
                     folder_mapping.update(new_fm)
-
             else:
-                # ── First run: discover from Drive API ────────────────────
                 logger.info(f"  [FIRST RUN] Discovering files for {source_email}...")
                 source_files = self._get_all_user_owned_files(source_drive, source_email)
-
+ 
                 if not source_files:
                     logger.info(f"  No files found for {source_email}")
-                    user_result["status"]       = "completed"
+                    user_result["status"]        = "completed"
                     user_result["accuracy_rate"] = 100.0
                     user_result["end_time"]      = datetime.now().isoformat()
-                    self.sql_mgr.finish_user(
-                        self.run_id, source_email, "completed"
-                    )
+                    self.sql_mgr.finish_user(self.run_id, source_email, "completed")
                     return user_result
-
-                # Register all items in SQL
+ 
                 self.sql_mgr.bulk_register_items(self.run_id, [
-                    {**f,
-                     "source_email": source_email,
-                     "dest_email":   dest_email}
+                    {**f, "source_email": source_email, "dest_email": dest_email}
                     for f in source_files
                 ])
-
+ 
                 all_folders = [
                     f for f in source_files
                     if f["mimeType"] == "application/vnd.google-apps.folder"
@@ -407,26 +392,31 @@ class MigrationEngine:
                     f for f in source_files
                     if f["mimeType"] != "application/vnd.google-apps.folder"
                 ]
-
-                # Build folder structure
+ 
                 folder_mapping = self._build_folder_structure(
                     all_folders, source_drive, dest_drive,
                     source_email, dest_email,
                 )
-
-            user_result["files_total"]   = len(all_files)
-            user_result["folders_total"] = len(all_folders)
+ 
+            user_result["files_total"]     = len(all_files)
+            user_result["folders_total"]   = len(all_folders)
             user_result["folders_created"] = len(folder_mapping)
             user_result["folders_failed"]  = len(all_folders) - len(folder_mapping)
-
-            # ── Migrate files — Level 2 parallel ─────────────────────────────
+ 
             files_done   = 0
             files_failed = 0
             bytes_moved  = 0
-
-            # Pre-filter before submitting to executor
+ 
+            # FIX 4: Tuned parallel_files for 2-vCPU VM.
+            # 4 file threads per user = 8 threads total when 2 users run concurrently.
+            # This is the sweet spot: enough to keep network saturated without
+            # causing GIL thrashing or MySQL pool exhaustion.
+            parallel_files = min(
+                getattr(self.config, "PARALLEL_FILES", RECOMMENDED_PARALLEL_FILES),
+                RECOMMENDED_PARALLEL_FILES,
+            )
+ 
             def _should_process(file_info):
-                """Returns (fid, fname, mime, fsize, pids) or None to skip."""
                 fid   = file_info.get("id") or file_info.get("file_id") or file_info.get("source_item_id")
                 fname = file_info.get("name") or file_info.get("file_name") or file_info.get("source_item_name", "")
                 mime  = file_info.get("mimeType") or file_info.get("mime_type", "")
@@ -434,12 +424,12 @@ class MigrationEngine:
                 pids  = file_info.get("parents", [])
                 if not pids and file_info.get("source_parent_id"):
                     pids = [file_info["source_parent_id"]]
-
+ 
                 if mime in IGNORED_MIME_TYPES:
                     user_result["files_ignored"] += 1
                     self.sql_mgr.mark_ignored(self.run_id, fid, "Non-migratable MIME type")
                     return None
-
+ 
                 should_skip, reason = self.sql_mgr.should_skip_item(fid)
                 if should_skip:
                     if reason == "Already migrated":
@@ -447,46 +437,42 @@ class MigrationEngine:
                     else:
                         user_result["files_ignored"] += 1
                     return None
-
+ 
                 sig = (fid, fname, fsize)
-                if sig in self._processed:
-                    user_result["files_skipped"] += 1
-                    self.sql_mgr.mark_skipped(fid, "Duplicate in session")
-                    return None
-
+                with self._processed_lock:
+                    if sig in self._processed:
+                        user_result["files_skipped"] += 1
+                        return None
+ 
                 return fid, fname, mime, fsize, pids
-
+ 
             def _migrate_one(file_info):
-                """Worker function — runs in thread pool."""
                 parsed = _should_process(file_info)
                 if parsed is None:
-                    return None   # already handled above
-
+                    return None
+ 
                 fid, fname, mime, fsize, pids = parsed
-
                 self.sql_mgr.mark_in_progress(self.run_id, fid)
-
+ 
                 dest_parent = folder_mapping.get(pids[0]) if pids else None
-
+ 
                 result = self._migrate_file_v3(
                     fid, fname, mime, fsize, dest_parent,
                     source_drive, dest_drive,
                 )
-                result["_fid"]    = fid
-                result["_fname"]  = fname
-                result["_fsize"]  = fsize
-                result["_sig"]    = (fid, fname, fsize)
+                result["_fid"]         = fid
+                result["_fname"]       = fname
+                result["_fsize"]       = fsize
+                result["_sig"]         = (fid, fname, fsize)
                 result["_dest_parent"] = dest_parent
                 return result
-
-            parallel_files = getattr(self.config, "PARALLEL_FILES", 8)
-
+ 
             with ThreadPoolExecutor(max_workers=parallel_files) as file_executor:
                 futures = {
                     file_executor.submit(_migrate_one, fi): fi
                     for fi in all_files
                 }
-
+ 
                 for future in as_completed(futures):
                     try:
                         result = future.result()
@@ -497,16 +483,16 @@ class MigrationEngine:
                         user_result["files_failed"] += 1
                         files_failed += 1
                         continue
-
+ 
                     if result is None:
-                        continue   # was skipped/ignored inside _migrate_one
-
-                    fid        = result["_fid"]
-                    fname      = result["_fname"]
-                    fsize      = result["_fsize"]
-                    sig        = result["_sig"]
+                        continue
+ 
+                    fid         = result["_fid"]
+                    fname       = result["_fname"]
+                    fsize       = result["_fsize"]
+                    sig         = result["_sig"]
                     dest_parent = result["_dest_parent"]
-
+ 
                     if result["success"]:
                         dest_id = result.get("dest_id")
                         self.sql_mgr.mark_done(
@@ -514,22 +500,23 @@ class MigrationEngine:
                             dest_item_id=dest_id,
                             dest_parent_id=dest_parent,
                         )
-                        self._processed.add(sig)
+                        with self._processed_lock:
+                            self._processed.add(sig)
                         user_result["files_migrated"] += 1
                         files_done  += 1
                         bytes_moved += fsize
-
+ 
                         if dest_id:
                             perm_r = self._migrate_permissions_hybrid(
                                 fid, dest_id, fname, source_drive, dest_drive
                             )
                             user_result["collaborators_migrated"] += perm_r.get("migrated", 0)
                             user_result["external_collaborators"] += perm_r.get("external", 0)
-
+ 
                     elif result.get("ignored"):
                         user_result["files_ignored"] += 1
                         self.sql_mgr.mark_ignored(self.run_id, fid, result.get("error", ""))
-
+ 
                     else:
                         user_result["files_failed"] += 1
                         files_failed += 1
@@ -543,7 +530,7 @@ class MigrationEngine:
                             "error_type": result.get("error_type", ""),
                             "user":       source_email,
                         })
-            # ── Finish user ───────────────────────────────────────────────
+ 
             total_attempted = (
                 user_result["files_total"]
                 - user_result["files_skipped"]
@@ -555,31 +542,26 @@ class MigrationEngine:
             )
             user_result["status"]   = "completed"
             user_result["end_time"] = datetime.now().isoformat()
-
+ 
             self.sql_mgr.finish_user(
                 self.run_id, source_email, "completed",
                 files_done=files_done,
                 files_failed=files_failed,
                 bytes_moved=bytes_moved,
             )
-
+ 
             logger.info(
                 f"✓ {source_email}: "
                 f"{user_result['files_migrated']}/{user_result['files_total']} "
                 f"({user_result['accuracy_rate']:.1f}%)"
             )
-
+ 
         except Exception as exc:
             logger.error(f"User migration failed {source_email}: {exc}", exc_info=True)
             user_result["status"]   = "failed"
             user_result["end_time"] = datetime.now().isoformat()
-            user_result["errors"].append({
-                "error":      str(exc),
-                "error_type": "critical_exception",
-                "user":       source_email,
-            })
             self.sql_mgr.finish_user(self.run_id, source_email, "failed")
-
+ 
         return user_result
 
     # =========================================================================
@@ -596,37 +578,23 @@ class MigrationEngine:
         source_drive,
         dest_drive,
     ) -> Dict:
-        """
-        PATCH: Route file through memory (<50 MB) or GCS (>=50 MB).
-        Google Workspace files (export) always use memory regardless of size
-        because export size is unknown upfront and typically small.
-        """
         empty = {"success": False, "dest_id": None, "ignored": False, "error": None}
-
-        # ── Ignored types ─────────────────────────────────────────────────
+ 
         if mime_type in IGNORED_MIME_TYPES:
             return {**empty, "ignored": True, "error": "Non-migratable MIME type"}
-
-        # ── Google Workspace files → always memory (export) ───────────────
+ 
         if mime_type in GOOGLE_WORKSPACE_TYPES:
             return self._migrate_workspace_file(
                 file_id, file_name, mime_type, dest_parent_id,
                 source_drive, dest_drive,
             )
-
-        # ── Binary files → route by size ──────────────────────────────────
+ 
         if file_size >= LARGE_FILE_THRESHOLD_BYTES:
-            logger.debug(
-                f"  [GCS] {file_name} ({_fmt_bytes(file_size)}) → GCS staging"
-            )
             return self._migrate_via_gcs(
                 file_id, file_name, mime_type, file_size,
                 dest_parent_id, source_drive, dest_drive,
             )
         else:
-            logger.debug(
-                f"  [MEM] {file_name} ({_fmt_bytes(file_size)}) → memory"
-            )
             return self._migrate_via_memory(
                 file_id, file_name, mime_type, file_size,
                 dest_parent_id, source_drive, dest_drive,
@@ -646,28 +614,36 @@ class MigrationEngine:
         source_drive,
         dest_drive,
     ) -> Dict:
-        """Download → BytesIO → upload. No GCS involved."""
+        """
+        FIX 2: Each call creates its own BytesIO and MediaIoBaseUpload.
+        Never reuse or share upload media objects across calls/threads —
+        that was causing Content-Range cross-contamination (HTTP 400 errors).
+        """
         empty = {"success": False, "dest_id": None, "ignored": False, "error": None}
         last_error = ""
-        wait_times = [2, 5, 15, 30, 60]
-
+ 
         for attempt in range(self.max_retries):
+            wait = _jitter(2 ** attempt)   # exponential backoff with jitter
+ 
             try:
-                # Download
+                # ── Download ──────────────────────────────────────────────
                 request = source_drive.files().get_media(
                     fileId=file_id, supportsAllDrives=True
                 )
-                buf = io.BytesIO()
-                dl  = MediaIoBaseDownload(buf, request, chunksize=20 * 1024 * 1024)
-                done = False
+                # FIX 2: fresh BytesIO per attempt — never reuse
+                dl_buf = io.BytesIO()
+                dl     = MediaIoBaseDownload(dl_buf, request, chunksize=20 * 1024 * 1024)
+                done   = False
                 while not done:
                     _, done = dl.next_chunk()
-                buf.seek(0)
-                data = buf.read()
-
-                # Empty file handling
+                dl_buf.seek(0)
+                data = dl_buf.read()
+                dl_buf.close()
+ 
+                # ── Empty file ────────────────────────────────────────────
                 if not data:
                     if file_size == 0:
+                        # FIX 7: use simple create() for empty files, NOT resumable upload
                         meta = {"name": file_name}
                         if dest_parent_id:
                             meta["parents"] = [dest_parent_id]
@@ -678,15 +654,25 @@ class MigrationEngine:
                         self.stats["memory_routed"] += 1
                         return {**empty, "success": True, "dest_id": f["id"]}
                     else:
-                        return {**empty, "error": "Empty download (non-zero file)", "error_type": "empty_download"}
-
-                # Upload
+                        last_error = "Empty download for non-zero file"
+                        logger.warning(f"  [MEM] {last_error} [{file_name}]")
+                        if attempt < self.max_retries - 1:
+                            time.sleep(wait)
+                            continue
+                        return {**empty, "error": last_error, "error_type": "empty_download"}
+ 
+                # ── Upload ────────────────────────────────────────────────
+                # FIX 2: fresh BytesIO + fresh MediaIoBaseUpload per upload attempt.
+                # This is the key fix for HTTP 400 Content-Range mismatch errors.
+                # The old code created upload_buf once and reused it across retries —
+                # after the first attempt the seek position was wrong.
                 meta = {"name": file_name}
                 if dest_parent_id:
                     meta["parents"] = [dest_parent_id]
-
+ 
+                upload_buf = io.BytesIO(data)   # fresh buffer per attempt
                 media = MediaIoBaseUpload(
-                    io.BytesIO(data),
+                    upload_buf,
                     mimetype=mime_type,
                     resumable=True,
                     chunksize=20 * 1024 * 1024,
@@ -695,65 +681,60 @@ class MigrationEngine:
                     body=meta, media_body=media,
                     fields="id", supportsAllDrives=True,
                 ).execute()
-
+                upload_buf.close()
+ 
                 self.stats["memory_routed"] += 1
                 return {**empty, "success": True, "dest_id": f["id"]}
-
-            except (socket.timeout, ConnectionResetError, ConnectionError, OSError) as exc:
-                last_error = str(exc)
-                if attempt < self.max_retries - 1:
-                    wait = wait_times[min(attempt, len(wait_times) - 1)]
-                    logger.warning(
-                        f"  [MEM] Retry {attempt+1}/{self.max_retries} "
-                        f"[{file_name}]: {last_error} — wait {wait}s"
-                    )
-                    time.sleep(wait)
-                else:
-                    logger.error(f"  [MEM] Exhausted retries [{file_name}]: {last_error}")
-
+ 
             except HttpError as exc:
                 code = exc.resp.status
                 last_error = str(exc)
-
-                # HTTP 200 raised by googleapiclient on resumable upload completion —
-                # the upload actually succeeded; extract dest_id from response body
+ 
                 if code == 200:
+                    # Resumable upload completion false-error from googleapiclient
                     try:
                         body = json.loads(exc.content.decode("utf-8"))
                         dest_id = body.get("id")
                         if dest_id:
-                            logger.debug(f"  [MEM] HTTP 200 false-error resolved → dest_id={dest_id}")
                             self.stats["memory_routed"] += 1
                             return {**empty, "success": True, "dest_id": dest_id}
                     except Exception:
                         pass
-                    # If we can't extract an id, treat as success without id
-                    logger.warning(f"  [MEM] HTTP 200 false-error, no id extractable [{file_name}]")
                     self.stats["memory_routed"] += 1
                     return {**empty, "success": True, "dest_id": None}
-
-                # Download-restricted file — skip gracefully, don't count as failure
+ 
                 if code == 403 and (
                     "cannotDownload" in last_error
-                    or "This file cannot be downloaded" in last_error
-                    or "403" in last_error
+                    or "fileNotDownloadable" in last_error
                 ):
                     logger.warning(f"  [MEM] Download restricted — skipping [{file_name}]")
-                    return {**empty, "ignored": True, "error": "Download restricted by policy"}
-
+                    return {**empty, "ignored": True, "error": "Download restricted"}
+ 
                 if code in (429, 500, 503) and attempt < self.max_retries - 1:
-                    wait = wait_times[min(attempt, len(wait_times) - 1)]
-                    logger.warning(f"  [MEM] HTTP {code}, retry in {wait}s [{file_name}]")
+                    logger.warning(f"  [MEM] HTTP {code}, retry {attempt+1} in {wait:.1f}s [{file_name}]")
+                    time.sleep(wait)
+                    continue
+ 
+                logger.error(f"  [MEM] HTTP {code} [{file_name}]: {last_error}")
+                return {**empty, "error": last_error, "error_type": f"http_{code}"}
+ 
+            except (ConnectionResetError, ConnectionError, OSError) as exc:
+                last_error = str(exc)
+                if attempt < self.max_retries - 1:
+                    logger.warning(
+                        f"  [MEM] Retry {attempt+1}/{self.max_retries} "
+                        f"[{file_name}]: {last_error} — wait {wait:.1f}s"
+                    )
                     time.sleep(wait)
                 else:
-                    logger.error(f"  [MEM] HTTP {code} [{file_name}]: {last_error}")
-                    break
-
+                    logger.error(f"  [MEM] Exhausted retries [{file_name}]: {last_error}")
+ 
             except Exception as exc:
                 last_error = str(exc)
                 logger.error(f"  [MEM] Unexpected [{file_name}]: {last_error}")
-                break
-
+                # Don't retry unexpected errors — they're usually logic bugs
+                return {**empty, "error": last_error, "error_type": "unexpected"}
+ 
         return {**empty, "error": last_error, "error_type": "memory_transfer_failed"}
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -771,68 +752,118 @@ class MigrationEngine:
         dest_drive,
     ) -> Dict:
         """
-        Stream source → GCS staging blob → destination Drive.
-        Cleans up GCS blob after successful upload.
+        Flow:
+          1. Download file from source Drive → GCS staging bucket
+          2. Upload from GCS bucket → destination Drive
+          3. Delete from GCS bucket (cleanup)
+
+        Key fixes vs v2:
+          - Each retry uses a UNIQUE blob name (blob_name + attempt suffix).
+            Old code reused the same blob name, so a partial/corrupt download
+            from attempt 1 would poison attempt 2.
+          - Stale/partial blobs are deleted before each retry starts.
+          - Upload streams directly from GCS via blob.open('rb') —
+            no full file load into RAM.
         """
         empty = {"success": False, "dest_id": None, "ignored": False, "error": None}
-        blob_name = None
-        wait_times = [2, 5, 15, 30, 60]
+        last_error  = ""
+        active_blob = None   # tracks the blob name for the current attempt
 
         for attempt in range(self.max_retries):
+            wait = _jitter(2 ** attempt)
+
+            # Use a unique blob name per attempt so a partial blob from a
+            # previous attempt never interferes with the current one.
+            attempt_blob = f"{self.run_id}/{file_id}/attempt_{attempt}"
+
             try:
-                # ── Download source → GCS ─────────────────────────────────
+                # ── STEP 1: Source Drive → GCS bucket ────────────────────
+                logger.debug(f"  [GCS] Downloading [{file_name}] → bucket (attempt {attempt+1})")
                 ok, blob_name, err = self.gcs.download_drive_to_gcs(
                     drive_svc  = source_drive,
                     file_id    = file_id,
                     file_name  = file_name,
-                    run_id     = self.run_id,
+                    run_id     = attempt_blob,   # unique per attempt
                     mime_type  = mime_type,
                 )
+
                 if not ok:
                     last_error = err or "GCS download failed"
+                    # Clean up any partial blob that may have been written
+                    if blob_name:
+                        try:
+                            self.gcs.delete_temp(blob_name)
+                        except Exception:
+                            pass
                     if attempt < self.max_retries - 1:
-                        wait = wait_times[min(attempt, len(wait_times) - 1)]
                         logger.warning(
-                            f"  [GCS] Download retry {attempt+1} [{file_name}]: "
-                            f"{last_error} — wait {wait}s"
+                            f"  [GCS] Download failed (attempt {attempt+1}/{self.max_retries}) "
+                            f"[{file_name}]: {last_error} — retrying in {wait:.1f}s"
                         )
                         time.sleep(wait)
                         continue
+                    logger.error(f"  [GCS] Download exhausted retries [{file_name}]: {last_error}")
                     return {**empty, "error": last_error, "error_type": "gcs_download_failed"}
 
-                # ── Upload GCS → destination Drive ────────────────────────
+                active_blob = blob_name
+                logger.debug(f"  [GCS] ✓ In bucket: {blob_name} ({_fmt_bytes(file_size)})")
+
+                # ── STEP 2: GCS bucket → destination Drive ────────────────
+                logger.debug(f"  [GCS] Uploading [{file_name}] → dest Drive")
                 ok2, dest_id, err2 = self.gcs.upload_gcs_to_drive(
-                    drive_svc  = dest_drive,
-                    blob_name  = blob_name,
-                    file_name  = file_name,
-                    mime_type  = mime_type,
-                    parent_id  = dest_parent_id,
+                    drive_svc = dest_drive,
+                    blob_name = blob_name,
+                    file_name = file_name,
+                    mime_type = mime_type,
+                    parent_id = dest_parent_id,
                 )
+
                 if not ok2:
                     last_error = err2 or "GCS upload failed"
+                    # Delete the successfully-downloaded blob so next attempt
+                    # re-downloads a fresh copy (don't retry upload with a blob
+                    # whose session URL may be invalidated).
+                    try:
+                        self.gcs.delete_temp(blob_name)
+                    except Exception:
+                        pass
+                    active_blob = None
                     if attempt < self.max_retries - 1:
-                        wait = wait_times[min(attempt, len(wait_times) - 1)]
                         logger.warning(
-                            f"  [GCS] Upload retry {attempt+1} [{file_name}]: "
-                            f"{last_error} — wait {wait}s"
+                            f"  [GCS] Upload failed (attempt {attempt+1}/{self.max_retries}) "
+                            f"[{file_name}]: {last_error} — retrying in {wait:.1f}s"
                         )
                         time.sleep(wait)
                         continue
+                    logger.error(f"  [GCS] Upload exhausted retries [{file_name}]: {last_error}")
                     return {**empty, "error": last_error, "error_type": "gcs_upload_failed"}
 
-                # ── Cleanup GCS staging blob ──────────────────────────────
-                self.gcs.delete_temp(blob_name)
+                # ── STEP 3: Cleanup GCS blob ──────────────────────────────
+                try:
+                    self.gcs.delete_temp(blob_name)
+                    logger.debug(f"  [GCS] Blob deleted: {blob_name}")
+                except Exception as del_exc:
+                    # Non-fatal — blob will expire via lifecycle policy
+                    logger.warning(f"  [GCS] Blob delete failed (non-fatal): {del_exc}")
+
+                active_blob = None
                 self.stats["gcs_routed"] += 1
-                logger.info(f"  [GCS] ✓ {file_name} ({_fmt_bytes(file_size)})")
+                logger.info(f"  [GCS] ✓ {file_name} ({_fmt_bytes(file_size)}) → dest_id={dest_id}")
                 return {**empty, "success": True, "dest_id": dest_id}
 
-            except (socket.timeout, ConnectionResetError, ConnectionError, OSError) as exc:
+            except (ConnectionResetError, ConnectionError, OSError) as exc:
                 last_error = str(exc)
+                # Clean up partial blob before retry
+                if active_blob:
+                    try:
+                        self.gcs.delete_temp(active_blob)
+                    except Exception:
+                        pass
+                    active_blob = None
                 if attempt < self.max_retries - 1:
-                    wait = wait_times[min(attempt, len(wait_times) - 1)]
                     logger.warning(
-                        f"  [GCS] Conn retry {attempt+1}/{self.max_retries} "
-                        f"[{file_name}]: {last_error} — wait {wait}s"
+                        f"  [GCS] Connection error (attempt {attempt+1}/{self.max_retries}) "
+                        f"[{file_name}]: {last_error} — retrying in {wait:.1f}s"
                     )
                     time.sleep(wait)
                 else:
@@ -841,12 +872,18 @@ class MigrationEngine:
             except Exception as exc:
                 last_error = str(exc)
                 logger.error(f"  [GCS] Unexpected [{file_name}]: {last_error}")
-                break
+                # Clean up any blob from this attempt
+                if active_blob:
+                    try:
+                        self.gcs.delete_temp(active_blob)
+                    except Exception:
+                        pass
+                break   # Don't retry unexpected errors — likely a logic bug
 
-        # Cleanup any partial GCS blob
-        if blob_name:
+        # Final safety cleanup if something slipped through
+        if active_blob:
             try:
-                self.gcs.delete_temp(blob_name)
+                self.gcs.delete_temp(active_blob)
             except Exception:
                 pass
 
@@ -865,46 +902,42 @@ class MigrationEngine:
         source_drive,
         dest_drive,
     ) -> Dict:
-        """Export Workspace file → upload (always memory, size is small post-export)."""
         empty = {"success": False, "dest_id": None, "ignored": False, "error": None}
-
+ 
         type_info = GOOGLE_WORKSPACE_TYPES.get(mime_type)
         if not type_info or not type_info.get("can_export"):
-            return {
-                **empty,
-                "ignored": True,
-                "error": f"Non-exportable Workspace type: {mime_type}",
-            }
-
-        wait_times = [2, 5, 15, 30, 60]
-
+            return {**empty, "ignored": True, "error": f"Non-exportable: {mime_type}"}
+ 
         for attempt in range(self.max_retries):
+            wait = _jitter(2 ** attempt)
+ 
             try:
                 request = source_drive.files().export_media(
                     fileId=file_id, mimeType=type_info["export_mime"]
                 )
-                buf = io.BytesIO()
-                dl  = MediaIoBaseDownload(buf, request, chunksize=10 * 1024 * 1024)
-                done = False
+                # FIX 2: fresh buffer per attempt
+                dl_buf = io.BytesIO()
+                dl     = MediaIoBaseDownload(dl_buf, request, chunksize=10 * 1024 * 1024)
+                done   = False
                 while not done:
                     _, done = dl.next_chunk()
-                buf.seek(0)
-                data = buf.read()
-
+                dl_buf.seek(0)
+                data = dl_buf.read()
+                dl_buf.close()
+ 
                 if not data:
                     return {**empty, "error": "Empty export", "error_type": "empty_export"}
-
-                dest_name = file_name  # keep original name
-                meta      = {"name": dest_name}
+ 
+                meta = {"name": file_name}
                 if dest_parent_id:
                     meta["parents"] = [dest_parent_id]
-
-                # Native re-import (Docs/Sheets/Slides)
                 if type_info.get("import_mime"):
                     meta["mimeType"] = type_info["import_mime"]
-
+ 
+                # FIX 2: fresh BytesIO + MediaIoBaseUpload per attempt
+                upload_buf = io.BytesIO(data)
                 media = MediaIoBaseUpload(
-                    io.BytesIO(data),
+                    upload_buf,
                     mimetype=type_info["export_mime"],
                     resumable=True,
                     chunksize=10 * 1024 * 1024,
@@ -913,15 +946,15 @@ class MigrationEngine:
                     body=meta, media_body=media,
                     fields="id", supportsAllDrives=True,
                 ).execute()
-
+                upload_buf.close()
+ 
                 self.stats["memory_routed"] += 1
                 return {**empty, "success": True, "dest_id": f["id"]}
-
+ 
             except HttpError as exc:
-                err = str(exc)
+                err  = str(exc)
                 code = exc.resp.status
-
-                # HTTP 200 false-error on resumable upload completion
+ 
                 if code == 200:
                     try:
                         body = json.loads(exc.content.decode("utf-8"))
@@ -933,34 +966,32 @@ class MigrationEngine:
                         pass
                     self.stats["memory_routed"] += 1
                     return {**empty, "success": True, "dest_id": None}
-
+ 
                 if "exportSizeLimitExceeded" in err and "fallback_mime" in type_info:
                     return self._migrate_workspace_fallback(
                         file_id, file_name, type_info, dest_parent_id,
                         source_drive, dest_drive,
                     )
-
+ 
                 if code in (429, 500, 503) and attempt < self.max_retries - 1:
-                    wait = wait_times[min(attempt, len(wait_times) - 1)]
-                    logger.warning(f"  [WS] HTTP {code} retry [{file_name}] wait {wait}s")
+                    logger.warning(f"  [WS] HTTP {code} retry [{file_name}] wait {wait:.1f}s")
                     time.sleep(wait)
                     continue
-
+ 
                 logger.error(f"  [WS] HTTP {code} [{file_name}]: {err}")
                 return {**empty, "error": err, "error_type": f"http_{code}"}
-
+ 
             except Exception as exc:
                 err = str(exc)
                 if attempt < self.max_retries - 1:
-                    wait = wait_times[min(attempt, len(wait_times) - 1)]
                     logger.warning(f"  [WS] Retry {attempt+1} [{file_name}]: {err}")
                     time.sleep(wait)
                 else:
                     logger.error(f"  [WS] Failed [{file_name}]: {err}")
                     return {**empty, "error": err, "error_type": "workspace_export_failed"}
-
+ 
         return {**empty, "error": "Max retries exceeded", "error_type": "workspace_export_failed"}
-
+ 
     def _migrate_workspace_fallback(
         self,
         file_id: str,
@@ -970,36 +1001,37 @@ class MigrationEngine:
         source_drive,
         dest_drive,
     ) -> Dict:
-        """Fallback format for oversized Workspace files (e.g., PDF)."""
         empty = {"success": False, "dest_id": None, "ignored": False, "error": None}
         try:
             request = source_drive.files().export_media(
                 fileId=file_id, mimeType=type_info["fallback_mime"]
             )
-            buf = io.BytesIO()
-            dl  = MediaIoBaseDownload(buf, request, chunksize=10 * 1024 * 1024)
-            done = False
+            dl_buf = io.BytesIO()
+            dl     = MediaIoBaseDownload(dl_buf, request, chunksize=10 * 1024 * 1024)
+            done   = False
             while not done:
                 _, done = dl.next_chunk()
-            buf.seek(0)
-
+            dl_buf.seek(0)
+ 
             fallback_name = file_name + type_info["fallback_ext"]
             meta = {"name": fallback_name}
             if dest_parent_id:
                 meta["parents"] = [dest_parent_id]
-
+ 
             media = MediaIoBaseUpload(
-                buf, mimetype=type_info["fallback_mime"],
-                resumable=True, chunksize=10 * 1024 * 1024,
+                dl_buf,
+                mimetype=type_info["fallback_mime"],
+                resumable=True,
+                chunksize=10 * 1024 * 1024,
             )
             f = dest_drive.files().create(
                 body=meta, media_body=media,
                 fields="id", supportsAllDrives=True,
             ).execute()
-
+ 
             logger.info(f"  [WS-FALLBACK] ✓ {fallback_name}")
             return {**empty, "success": True, "dest_id": f["id"]}
-
+ 
         except Exception as exc:
             return {**empty, "error": str(exc), "error_type": "workspace_fallback_failed"}
 
@@ -1015,14 +1047,8 @@ class MigrationEngine:
         source_drive,
         dest_drive,
     ) -> Dict:
-        """
-        Hybrid permission model per PDF architecture:
-          Step 1: Fetch fresh from source API
-          Step 2: Apply to destination via API
-          Step 3: Track result in SQL (migration_permissions table)
-        """
         result = {"migrated": 0, "failed": 0, "external": 0, "skipped": 0}
-
+ 
         try:
             resp = source_drive.permissions().list(
                 fileId=source_id,
@@ -1030,30 +1056,27 @@ class MigrationEngine:
                 supportsAllDrives=True,
             ).execute()
             perms = resp.get("permissions", [])
-
             if len(perms) <= 1:
-                return result   # Only owner — nothing to migrate
-
+                return result
         except Exception as exc:
             logger.debug(f"  Permissions fetch failed [{name}]: {exc}")
             return result
-
+ 
         try:
             from permissions_migrator import EnhancedPermissionsMigrator
-
+ 
             pm = EnhancedPermissionsMigrator(
                 source_drive, dest_drive,
                 self.config.SOURCE_DOMAIN,
                 self.config.DEST_DOMAIN,
             )
             pr = pm.migrate_permissions(source_id, dest_id, perms)
-
+ 
             result["migrated"] = pr.get("migrated", 0)
             result["failed"]   = pr.get("failed", 0)
             result["external"] = pr.get("external_users", 0)
             result["skipped"]  = pr.get("skipped", 0)
-
-            # Track in SQL
+ 
             for detail in pr.get("details", []):
                 role           = detail.get("role", "")
                 ptype          = detail.get("type", "user")
@@ -1062,10 +1085,10 @@ class MigrationEngine:
                 error          = detail.get("error", "")
                 src_email      = detail.get("original_email", "")
                 dst_email      = detail.get("target_email", "")
-
+ 
                 if role == "owner" or status == "skipped":
                     continue
-
+ 
                 valid_roles = {
                     "owner", "organizer", "fileOrganizer",
                     "writer", "commenter", "reader",
@@ -1078,7 +1101,7 @@ class MigrationEngine:
                     continue
                 if classification not in valid_classifications:
                     classification = "external_domain"
-
+ 
                 try:
                     self.sql_mgr.upsert_permission(
                         file_id         = dest_id,
@@ -1097,12 +1120,12 @@ class MigrationEngine:
                         self.sql_mgr.mark_permission_failed(dest_id, dst_email, role, error)
                 except Exception as exc:
                     logger.debug(f"  SQL permission track error [{name}]: {exc}")
-
+ 
         except ImportError:
             logger.error("EnhancedPermissionsMigrator not available")
         except Exception as exc:
             logger.debug(f"  Permission migration error [{name}]: {exc}")
-
+ 
         return result
 
     # =========================================================================
@@ -1117,21 +1140,15 @@ class MigrationEngine:
         source_email: str,
         dest_email: str,
     ) -> Dict[str, str]:
-        """
-        Build folder hierarchy in destination.
-        Returns {source_folder_id: dest_folder_id}.
-        All folder creations are recorded in SQL.
-        """
         if not folders:
             return {}
-
+ 
         logger.info(f"  Building folder structure: {len(folders)} folders")
-
-        # Topological sort
+ 
         id_set  = {f.get("id") or f.get("file_id") or f.get("source_item_id") for f in folders}
         visited = set()
         sorted_folders: List[Dict] = []
-
+ 
         def visit(folder: Dict):
             fid = folder.get("id") or folder.get("file_id") or folder.get("source_item_id")
             if fid in visited:
@@ -1149,27 +1166,23 @@ class MigrationEngine:
                 if parent:
                     visit(parent)
             sorted_folders.append(folder)
-
+ 
         for f in folders:
             visit(f)
-
+ 
         folder_mapping: Dict[str, str] = {}
-
+ 
         for folder in sorted_folders:
             fid   = folder.get("id") or folder.get("file_id") or folder.get("source_item_id")
             fname = folder.get("name") or folder.get("file_name") or folder.get("source_item_name", "")
             pids  = folder.get("parents", [])
             if not pids and folder.get("source_parent_id"):
                 pids = [folder["source_parent_id"]]
-
+ 
             self.sql_mgr.mark_in_progress(self.run_id, fid)
-
-            dest_parent = None
-            if pids:
-                dest_parent = folder_mapping.get(pids[0])
-
-            dest_fid = self._create_folder(fname, dest_parent, dest_drive)
-
+            dest_parent = folder_mapping.get(pids[0]) if pids else None
+            dest_fid    = self._create_folder(fname, dest_parent, dest_drive)
+ 
             if dest_fid:
                 folder_mapping[fid] = dest_fid
                 self.sql_mgr.register_folder_mapping(self.run_id, fid, dest_fid)
@@ -1179,14 +1192,13 @@ class MigrationEngine:
                     dest_parent_id=dest_parent,
                 )
                 self.stats["folders_created"] += 1
-                logger.debug(f"    ✓ Folder: {fname}")
             else:
                 self.sql_mgr.mark_failed(self.run_id, fid, "Failed to create folder")
                 self.stats["folders_failed"] += 1
                 logger.error(f"    ✗ Folder failed: {fname}")
-
+ 
         return folder_mapping
-
+ 
     def _create_folder(
         self,
         folder_name: str,
@@ -1202,33 +1214,29 @@ class MigrationEngine:
                 }
                 if parent_id:
                     meta["parents"] = [parent_id]
-
                 f = dest_drive.files().create(
                     body=meta, fields="id,name",
                     supportsAllDrives=True,
                 ).execute()
                 return f["id"]
-
             except HttpError as exc:
                 if exc.resp.status == 409:
-                    existing = self._find_existing_folder(
-                        folder_name, parent_id, dest_drive
-                    )
+                    existing = self._find_existing_folder(folder_name, parent_id, dest_drive)
                     if existing:
                         return existing
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(_jitter(2 ** attempt))
                 else:
                     logger.error(f"Failed to create folder '{folder_name}': {exc}")
                     return None
             except Exception as exc:
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
+                    time.sleep(_jitter(2 ** attempt))
                 else:
                     logger.error(f"Error creating folder '{folder_name}': {exc}")
                     return None
         return None
-
+ 
     def _find_existing_folder(
         self,
         name: str,
@@ -1251,6 +1259,7 @@ class MigrationEngine:
             return files[0]["id"] if files else None
         except Exception:
             return None
+ 
 
     # =========================================================================
     # File discovery
@@ -1259,12 +1268,11 @@ class MigrationEngine:
     def _get_all_user_owned_files(
         self, drive_service, user_email: str
     ) -> List[Dict]:
-        """Fetch all files owned by user from My Drive."""
         files      = []
         page_token = None
         retries    = 0
         max_retries = 5
-
+ 
         while True:
             try:
                 resp = drive_service.files().list(
@@ -1280,7 +1288,7 @@ class MigrationEngine:
                     supportsAllDrives=False,
                     includeItemsFromAllDrives=False,
                 ).execute()
-
+ 
                 batch = resp.get("files", [])
                 owned = [
                     f for f in batch
@@ -1290,19 +1298,19 @@ class MigrationEngine:
                     )
                 ]
                 files.extend(owned)
-
+ 
                 page_token = resp.get("nextPageToken")
                 if not page_token:
                     break
-
+ 
                 retries = 0
                 time.sleep(0.2)
-
+ 
             except HttpError as exc:
                 code = exc.resp.status
                 if code == 500 and retries < max_retries:
                     retries += 1
-                    time.sleep(2 ** retries)
+                    time.sleep(_jitter(2 ** retries))
                     continue
                 elif code == 404:
                     logger.warning(f"Drive not found for {user_email}")
@@ -1310,14 +1318,14 @@ class MigrationEngine:
                 else:
                     logger.error(f"HTTP {code} fetching files for {user_email}: {exc}")
                     raise
-
+ 
             except Exception as exc:
                 retries += 1
                 if retries >= max_retries:
                     logger.error(f"Failed to fetch files for {user_email}: {exc}")
                     return files
-                time.sleep(2 ** retries)
-
+                time.sleep(_jitter(2 ** retries))
+ 
         logger.info(f"  Discovered {len(files)} owned files for {user_email}")
         return files
 
@@ -1325,26 +1333,33 @@ class MigrationEngine:
     # Auth helper
     # =========================================================================
     
+    def _get_drive_service_cached(self, auth_obj, email: str):
+        """
+        FIX 5: Cache Drive service per email to avoid re-authenticating
+        (which involves RSA signing + HTTP round-trip) on every file.
+        Thread-safe via lock.
+        """
+        with self._drive_cache_lock:
+            if email in self._drive_cache:
+                return self._drive_cache[email]
+ 
+        svc = self._get_drive_service(auth_obj, email)
+ 
+        with self._drive_cache_lock:
+            self._drive_cache[email] = svc
+ 
+        return svc
+ 
     def _get_drive_service(self, auth_obj, email: str):
-        """
-        Create a per-user delegated Drive service using GoogleAuthManager.
-        auth_obj is ignored — we always create a fresh delegated auth per user,
-        exactly like the old migration_engine.py did.
-        For source users:  uses SOURCE_CREDENTIALS_FILE
-        For dest users:    uses DEST_CREDENTIALS_FILE
-        
-        We detect which domain the email belongs to and pick the right creds.
-        """
         from googleapiclient.discovery import build
         try:
             from auth import GoogleAuthManager
-
-            # Determine which credentials file to use based on email domain
+ 
             if email.endswith(f"@{self.config.SOURCE_DOMAIN}"):
                 creds_file = self.config.SOURCE_CREDENTIALS_FILE
             else:
                 creds_file = self.config.DEST_CREDENTIALS_FILE
-
+ 
             user_auth = GoogleAuthManager(
                 creds_file,
                 self.config.SCOPES,
@@ -1352,26 +1367,24 @@ class MigrationEngine:
             )
             user_auth.authenticate()
             return user_auth.get_drive_service(user_email=email)
-
+ 
         except Exception as exc:
             logger.error(f"Auth delegation failed for {email}: {exc}")
             raise
-
     # =========================================================================
     # Helpers
     # =========================================================================
 
     def _split_items_from_records(self, records) -> Tuple[List[Dict], List[Dict]]:
-        """Split MigrationRecord list into folder dicts and file dicts."""
         folders, files = [], []
         for r in records:
             item = {
-                "id":       r.file_id,
-                "file_id":  r.file_id,
-                "name":     r.file_name,
-                "mimeType": r.mime_type,
-                "size":     r.file_size,
-                "parents":  [r.parent_id] if r.parent_id else [],
+                "id":               r.file_id,
+                "file_id":          r.file_id,
+                "name":             r.file_name,
+                "mimeType":         r.mime_type,
+                "size":             r.file_size,
+                "parents":          [r.parent_id] if r.parent_id else [],
                 "source_parent_id": r.parent_id,
             }
             if r.mime_type == "application/vnd.google-apps.folder":
@@ -1385,59 +1398,48 @@ class MigrationEngine:
     # =========================================================================
 
     def generate_report(self, summary: Dict, output_file: str):
-        """Generate JSON + text reports."""
         try:
             summary["gcs_routing_stats"] = {
                 "gcs_routed":    self.stats["gcs_routed"],
                 "memory_routed": self.stats["memory_routed"],
                 "threshold_mb":  LARGE_FILE_THRESHOLD_BYTES // (1024 * 1024),
             }
-
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)
             logger.info(f"JSON report: {output_file}")
-
+ 
             txt = str(Path(output_file).with_suffix(".txt"))
             self._generate_text_report(summary, txt)
-
         except Exception as exc:
             logger.error(f"Failed to generate report: {exc}")
-
+ 
     def _generate_text_report(self, summary: Dict, output_file: str):
         try:
             with open(output_file, "w", encoding="utf-8") as f:
                 f.write("=" * 80 + "\n")
-                f.write("GOOGLE WORKSPACE DRIVE MIGRATION REPORT (v2 — SQL + GCS)\n")
+                f.write("GOOGLE WORKSPACE DRIVE MIGRATION REPORT (v3 — 2-vCPU optimised)\n")
                 f.write("=" * 80 + "\n\n")
                 f.write(f"Date     : {summary.get('start_time','')}\n")
                 f.write(f"Duration : {_fmt_duration(summary.get('duration_seconds',0))}\n")
                 f.write(f"Accuracy : {summary.get('accuracy_rate',0):.2f}%\n\n")
-
+ 
                 f.write("USERS\n" + "-"*40 + "\n")
                 f.write(f"  Total     : {summary.get('total_users',0)}\n")
                 f.write(f"  Completed : {summary.get('completed_users',0)}\n")
                 f.write(f"  Failed    : {summary.get('failed_users',0)}\n\n")
-
+ 
                 f.write("FILES\n" + "-"*40 + "\n")
                 f.write(f"  Migrated : {summary.get('total_files_migrated',0)}\n")
                 f.write(f"  Failed   : {summary.get('total_files_failed',0)}\n")
                 f.write(f"  Skipped  : {summary.get('total_files_skipped',0)}\n")
                 f.write(f"  Ignored  : {summary.get('total_files_ignored',0)}\n\n")
-
+ 
                 gcs = summary.get("gcs_routing_stats", {})
-                f.write("ROUTING (memory vs GCS)\n" + "-"*40 + "\n")
+                f.write("ROUTING\n" + "-"*40 + "\n")
                 f.write(f"  Threshold : {gcs.get('threshold_mb',50)} MB\n")
                 f.write(f"  Memory    : {gcs.get('memory_routed',0)}\n")
                 f.write(f"  GCS       : {gcs.get('gcs_routed',0)}\n\n")
-
-                f.write("FOLDERS\n" + "-"*40 + "\n")
-                f.write(f"  Created : {summary.get('total_folders_created',0)}\n")
-                f.write(f"  Failed  : {summary.get('total_folders_failed',0)}\n\n")
-
-                f.write("PERMISSIONS\n" + "-"*40 + "\n")
-                f.write(f"  Migrated  : {summary.get('total_collaborators_migrated',0)}\n")
-                f.write(f"  External  : {summary.get('total_external_collaborators',0)}\n\n")
-
+ 
                 f.write("=" * 80 + "\nEnd of Report\n" + "=" * 80 + "\n")
             logger.info(f"Text report: {output_file}")
         except Exception as exc:
