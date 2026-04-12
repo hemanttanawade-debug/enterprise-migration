@@ -147,6 +147,10 @@ class GoogleAuthManager:
         if not self.creds:
             self.authenticate()
         return build('admin', 'directory_v1', credentials=self.creds)
+
+    def get_credentials(self):
+        """Return the raw delegated credentials object."""
+        return self.credentials   # or self._credentials, self.creds — whatever attr holds them
     
     # ============================================================================
     # GCS BUCKET AUTH

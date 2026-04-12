@@ -66,14 +66,16 @@ def _is_shared(src_drv: str, dst_drv: str) -> bool:
 
 class MigrationRecord:
     __slots__ = (
-        "file_id", "file_name", "mime_type", "file_size",
-        "parent_id", "dest_folder_id", "status",
-        "source_user_email", "dest_user_email",
-        "drive_type", "source_shared_drive_id", "dest_shared_drive_id",
-        # aliases used by migration_engine.py
-        "source_item_id", "source_item_name", "source_parent_id",
-        "file_size_bytes", "item_type",
-    )
+            "file_id", "file_name", "mime_type", "file_size",
+            "parent_id", "dest_folder_id", "status",
+            "source_user_email", "dest_user_email",
+            "drive_type", "source_shared_drive_id", "dest_shared_drive_id",
+            # aliases used by migration_engine.py
+            "source_item_id", "source_item_name", "source_parent_id",
+            "file_size_bytes", "item_type",
+            # NEW: aliases used by migration_engine.py global queue
+            "source_email", "dest_email",
+            )
 
     def __init__(self, row: dict):
         self.file_id                = row.get("file_id", "")
@@ -97,15 +99,19 @@ class MigrationRecord:
         is_folder = (self.mime_type == "application/vnd.google-apps.folder")
         self.item_type = "folder" if is_folder else "file"
 
+        # Global-queue aliases (migration_engine._process_queue_item reads these)
+        self.source_email = self.source_user_email
+        self.dest_email   = self.dest_user_email
+
     def to_dict(self) -> dict:
         """Return dict compatible with migration_engine pending-item format."""
         return {
-            "source_item_id":   self.file_id,
-            "source_item_name": self.file_name,
-            "mime_type":        self.mime_type,
-            "file_size_bytes":  self.file_size,
-            "source_parent_id": self.parent_id,
-        }
+                "source_item_id":   self.file_id,
+                "source_item_name": self.file_name,
+                "mime_type":        self.mime_type,
+                "file_size_bytes":  self.file_size,
+                "source_parent_id": self.parent_id,
+                }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,34 +123,34 @@ IGNORED_MIME_TYPES = frozenset({
     "application/vnd.google-apps.form",
     "application/vnd.google-apps.site",
     "application/octet-stream",
-})
+    })
 
 GOOGLE_WORKSPACE_EXPORT = {
-    "application/vnd.google-apps.document": (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".docx",
-        "application/vnd.google-apps.document",
-    ),
-    "application/vnd.google-apps.spreadsheet": (
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".xlsx",
-        "application/vnd.google-apps.spreadsheet",
-    ),
-    "application/vnd.google-apps.presentation": (
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        ".pptx",
-        "application/vnd.google-apps.presentation",
-    ),
-    "application/vnd.google-apps.drawing": (
-        "image/svg+xml", ".svg", None,
-    ),
-    "application/vnd.google-apps.jam": (
-        "application/pdf", ".pdf", None,
-    ),
-    "application/vnd.google-apps.map": (
-        "application/vnd.google-earth.kmz", ".kmz", None,
-    ),
-}
+        "application/vnd.google-apps.document": (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".docx",
+            "application/vnd.google-apps.document",
+            ),
+        "application/vnd.google-apps.spreadsheet": (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            ".xlsx",
+            "application/vnd.google-apps.spreadsheet",
+            ),
+        "application/vnd.google-apps.presentation": (
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            ".pptx",
+            "application/vnd.google-apps.presentation",
+            ),
+        "application/vnd.google-apps.drawing": (
+            "image/svg+xml", ".svg", None,
+            ),
+        "application/vnd.google-apps.jam": (
+            "application/pdf", ".pdf", None,
+            ),
+        "application/vnd.google-apps.map": (
+            "application/vnd.google-earth.kmz", ".kmz", None,
+            ),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -179,21 +185,21 @@ class SQLStateManager:
     LARGE_FILE_THRESHOLD = 50   # MB
     _SHARED_DRIVE_MEMBER_ROLES = frozenset({
         "organizer", "fileOrganizer", "writer", "commenter", "reader",
-    })
+        })
 
     def __init__(
-        self,
-        db_config: Dict,
-        gcs_bucket: str,
-        gcs_key_file: str,
-        source_domain: str,
-        dest_domain: str,
-        migration_id: str = None,
-        gcs_prefix: str = DEFAULT_PREFIX,
-        large_file_threshold_mb: int = LARGE_FILE_THRESHOLD,
-        source_shared_drive_id: str = None,
-        dest_shared_drive_id: str = None,
-    ):
+            self,
+            db_config: Dict,
+            gcs_bucket: str,
+            gcs_key_file: str,
+            source_domain: str,
+            dest_domain: str,
+            migration_id: str = None,
+            gcs_prefix: str = DEFAULT_PREFIX,
+            large_file_threshold_mb: int = LARGE_FILE_THRESHOLD,
+            source_shared_drive_id: str = None,
+            dest_shared_drive_id: str = None,
+            ):
         self.migration_id    = migration_id or str(uuid.uuid4())
         self.source_domain   = source_domain
         self.dest_domain     = dest_domain
@@ -206,40 +212,40 @@ class SQLStateManager:
         self.dest_shared_drive_id   = _s(dest_shared_drive_id)
 
         self._shared_drive_mode = _is_shared(
-            self.source_shared_drive_id, self.dest_shared_drive_id
-        )
+                self.source_shared_drive_id, self.dest_shared_drive_id
+                )
         self._drive_type = "SHARED_DRIVE" if self._shared_drive_mode else "MY_DRIVE"
 
         logger.info(
-            f"SQLStateManager init | id={self.migration_id} | mode={self._drive_type}"
-            + (
-                f" | src_drv={self.source_shared_drive_id}"
-                f" | dst_drv={self.dest_shared_drive_id}"
-                if self._shared_drive_mode else
-                f" | {source_domain} → {dest_domain}"
-            )
-        )
+                f"SQLStateManager init | id={self.migration_id} | mode={self._drive_type}"
+                + (
+                    f" | src_drv={self.source_shared_drive_id}"
+                    f" | dst_drv={self.dest_shared_drive_id}"
+                    if self._shared_drive_mode else
+                    f" | {source_domain} → {dest_domain}"
+                    )
+                )
 
         # ── MySQL connection pool ──────────────────────────────────────────
         # NEW — pool size = (max_users × parallel_files) + headroom
         # With 10 users × 5 files + folder threads = needs ~60; cap at MySQL's safe limit
         self._pool = pooling.MySQLConnectionPool(
-            pool_name=f"migration_pool_{uuid.uuid4().hex[:8]}",  # unique name avoids pool name collision on re-init
-            pool_size=32,          # safe ceiling: MySQL default max_connections=151
-            pool_reset_session=True,
-            connection_timeout=30, # wait up to 30s for a free connection before raising
-            **db_config,
-        )
+                pool_name=f"migration_pool_{uuid.uuid4().hex[:8]}",  # unique name avoids pool name collision on re-init
+                pool_size=32,          # safe ceiling: MySQL default max_connections=151
+                pool_reset_session=True,
+                connection_timeout=30, # wait up to 30s for a free connection before raising
+                **db_config,
+                )
         logger.info(
-            f"SQL pool → {db_config.get('host')}:{db_config.get('port', 3306)}"
-            f"/{db_config.get('database')}"
-        )
+                f"SQL pool → {db_config.get('host')}:{db_config.get('port', 3306)}"
+                f"/{db_config.get('database')}"
+                )
 
         # ── GCS client ────────────────────────────────────────────────────
         creds = service_account.Credentials.from_service_account_file(
-            gcs_key_file,
-            scopes=["https://www.googleapis.com/auth/cloud-platform"],
-        )
+                gcs_key_file,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
+                )
         self._gcs    = gcs_storage.Client(credentials=creds, project=creds.project_id)
         self._bucket = self._gcs.bucket(gcs_bucket)
         logger.info(f"GCS client → bucket={gcs_bucket}")
@@ -284,9 +290,9 @@ class SQLStateManager:
                 if "pool exhausted" in str(exc).lower() or "PoolError" in type(exc).__name__:
                     sleep_time = wait * (2 ** attempt)   # 0.5, 1, 2, 4, 8, 16s
                     logger.warning(
-                        f"SQL pool exhausted (attempt {attempt+1}/{retries}) "
-                        f"— retrying in {sleep_time:.1f}s"
-                    )
+                            f"SQL pool exhausted (attempt {attempt+1}/{retries}) "
+                            f"— retrying in {sleep_time:.1f}s"
+                            )
                     time.sleep(sleep_time)
                 else:
                     raise   # non-pool errors fail immediately
@@ -322,7 +328,7 @@ class SQLStateManager:
 
     def create_migration_run(self, total_items: int = 0) -> str:
         self._execute(
-            """
+                """
             INSERT INTO migration_runs
                 (migration_id, source_domain, destination_domain,
                  start_time, status, total_items)
@@ -333,7 +339,7 @@ class SQLStateManager:
                 total_items = VALUES(total_items)
             """,
             (self.migration_id, self.source_domain, self.dest_domain, total_items),
-        )
+            )
         logger.info(f"migration_run ready: {self.migration_id}")
         return self.migration_id
 
@@ -342,9 +348,9 @@ class SQLStateManager:
         if status.upper() not in valid:
             status = "FAILED"
         self._execute(
-            "UPDATE migration_runs SET status=%s, end_time=NOW() WHERE migration_id=%s",
-            (status.upper(), self.migration_id),
-        )
+                "UPDATE migration_runs SET status=%s, end_time=NOW() WHERE migration_id=%s",
+                (status.upper(), self.migration_id),
+                )
 
     def update_run_counters(self, **kwargs):
         """
@@ -352,12 +358,12 @@ class SQLStateManager:
         Accepted keys: completed | failed | skipped | ignored | size_bytes
         """
         col_map = {
-            "completed":  "completed_items     = completed_items     + %s",
-            "failed":     "failed_items        = failed_items        + %s",
-            "skipped":    "skipped_items       = skipped_items       + %s",
-            "ignored":    "ignored_items       = ignored_items       + %s",
-            "size_bytes": "migrated_size_bytes = migrated_size_bytes + %s",
-        }
+                "completed":  "completed_items     = completed_items     + %s",
+                "failed":     "failed_items        = failed_items        + %s",
+                "skipped":    "skipped_items       = skipped_items       + %s",
+                "ignored":    "ignored_items       = ignored_items       + %s",
+                "size_bytes": "migrated_size_bytes = migrated_size_bytes + %s",
+                }
         parts, vals = [], []
         for k, v in kwargs.items():
             if k in col_map:
@@ -367,11 +373,11 @@ class SQLStateManager:
             return
         vals.append(self.migration_id)
         self._execute(
-            f"UPDATE migration_runs "
-            f"SET {', '.join(parts)}, last_processed_at=NOW() "
-            f"WHERE migration_id=%s",
-            tuple(vals),
-        )
+                f"UPDATE migration_runs "
+                f"SET {', '.join(parts)}, last_processed_at=NOW() "
+                f"WHERE migration_id=%s",
+                tuple(vals),
+                )
 
     # ── User-level run tracking (migration_engine.py interface) ──────────────
 
@@ -381,24 +387,24 @@ class SQLStateManager:
         # Extend: could upsert a user-level table here if needed
 
     def finish_user(
-        self,
-        run_id,
-        source_email: str,
-        status: str,
-        files_done: int = 0,
-        files_failed: int = 0,
-        bytes_moved: int = 0,
-    ):
+            self,
+            run_id,
+            source_email: str,
+            status: str,
+            files_done: int = 0,
+            files_failed: int = 0,
+            bytes_moved: int = 0,
+            ):
         """Called by migration_engine.py when a user finishes."""
         logger.info(
-            f"[run={run_id}] finish_user: {source_email} | "
-            f"status={status} | done={files_done} | failed={files_failed}"
-        )
+                f"[run={run_id}] finish_user: {source_email} | "
+                f"status={status} | done={files_done} | failed={files_failed}"
+                )
         self.update_run_counters(
-            completed=files_done,
-            failed=files_failed,
-            size_bytes=bytes_moved,
-        )
+                completed=files_done,
+                failed=files_failed,
+                size_bytes=bytes_moved,
+                )
 
     # ── Shared Drive run tracking (DomainMigrationEngine interface) ───────────
 
@@ -411,17 +417,17 @@ class SQLStateManager:
         logger.debug(f"[run={run_id}] upsert_shared_drive: {drive_name} ({drive_id})")
 
     def finish_shared_drive(
-        self,
-        run_id,
-        drive_id: str,
-        status: str,
-        files_total: int = 0,
-        files_done: int = 0,
-    ):
+            self,
+            run_id,
+            drive_id: str,
+            status: str,
+            files_total: int = 0,
+            files_done: int = 0,
+            ):
         logger.info(
-            f"[run={run_id}] finish_shared_drive: {drive_id} | "
-            f"status={status} | total={files_total} | done={files_done}"
-        )
+                f"[run={run_id}] finish_shared_drive: {drive_id} | "
+                f"status={status} | total={files_total} | done={files_done}"
+                )
 
     def finish_run(self, run_id, status: str):
         self.finish_migration_run(status.upper())
@@ -431,13 +437,13 @@ class SQLStateManager:
     # ─────────────────────────────────────────────────────────────────────────
 
     def register_discovered_items(
-        self,
-        items: List[Dict],
-        source_email: str,
-        dest_email: str,
-        source_shared_drive_id: str = None,
-        dest_shared_drive_id: str   = None,
-    ):
+            self,
+            items: List[Dict],
+            source_email: str,
+            dest_email: str,
+            source_shared_drive_id: str = None,
+            dest_shared_drive_id: str   = None,
+            ):
         """
         Bulk-insert discovered files/folders.
 
@@ -486,9 +492,9 @@ class SQLStateManager:
             parents = item.get("parents", [])
             # Support both Drive API format (parents list) and internal format (source_parent_id)
             parent_id = (
-                item.get("source_parent_id")
-                or (parents[0] if parents else None)
-            )
+                    item.get("source_parent_id")
+                    or (parents[0] if parents else None)
+                    )
             fid = item.get("id") or item.get("source_item_id") or ""
             fname = item.get("name") or item.get("source_item_name") or ""
             fsize = int(item.get("size") or item.get("file_size_bytes") or 0)
@@ -510,10 +516,10 @@ class SQLStateManager:
                 is_fld,              # is_folder
                 status,              # status
                 fsize,               # file_size
-            ))
+                ))
 
         self._execute(
-            """
+                """
             INSERT IGNORE INTO migration_items
                 (migration_id, source_domain, destination_domain,
                  drive_type, source_shared_drive_id, dest_shared_drive_id,
@@ -525,7 +531,7 @@ class SQLStateManager:
             """,
             rows,
             many=True,
-        )
+            )
 
         # Refresh in-memory cache
         for item, row in zip(items, rows):
@@ -543,16 +549,16 @@ class SQLStateManager:
                 "drive_type":             drive_type,
                 "source_shared_drive_id": row[4],
                 "dest_shared_drive_id":   row[5],
-            })
+                })
 
         logger.info(
-            f"Registered {len(rows)} items | {drive_type} | "
-            + (
-                f"drv_src={db_src_drv} drv_dst={db_dst_drv}"
-                if shared else
-                f"src={source_email} dst={dest_email}"
-            )
-        )
+                f"Registered {len(rows)} items | {drive_type} | "
+                + (
+                    f"drv_src={db_src_drv} drv_dst={db_dst_drv}"
+                    if shared else
+                    f"src={source_email} dst={dest_email}"
+                    )
+                )
 
     def bulk_register_items(self, run_id, items: List[Dict]):
         """
@@ -572,22 +578,22 @@ class SQLStateManager:
 
         for (src_email, dst_email), group in groups.items():
             self.register_discovered_items(
-                group,
-                source_email=src_email,
-                dest_email=dst_email,
-                # No drive IDs → My Drive scope
-            )
+                    group,
+                    source_email=src_email,
+                    dest_email=dst_email,
+                    # No drive IDs → My Drive scope
+                    )
 
     # ─────────────────────────────────────────────────────────────────────────
     # migration_items  —  folder mapping
     # ─────────────────────────────────────────────────────────────────────────
 
     def register_folder_mapping(
-        self,
-        run_id_or_file_id,      # overloaded: (run_id, src_id) OR (src_id,) — see below
-        dest_folder_id_or_src=None,
-        dest_folder_id_last=None,
-    ):
+            self,
+            run_id_or_file_id,      # overloaded: (run_id, src_id) OR (src_id,) — see below
+            dest_folder_id_or_src=None,
+            dest_folder_id_last=None,
+            ):
         """
         Two call signatures supported:
           Old (v3):  register_folder_mapping(source_folder_id, dest_folder_id)
@@ -603,20 +609,20 @@ class SQLStateManager:
             dest_folder_id   = dest_folder_id_or_src
 
         self._execute(
-            """
+                """
             UPDATE migration_items
                SET dest_folder_id = %s
              WHERE migration_id = %s
                AND file_id      = %s
             """,
             (dest_folder_id, self.migration_id, source_folder_id),
-        )
+            )
         if source_folder_id in self._cache:
             self._cache[source_folder_id].dest_folder_id = dest_folder_id
 
     def get_folder_mapping(
-        self, run_id, source_email: str = None
-    ) -> Dict[str, str]:
+            self, run_id, source_email: str = None
+            ) -> Dict[str, str]:
         """
         Return {source_folder_id: dest_folder_id} for all folders that already
         have a dest_folder_id (i.e. were successfully created on a previous run).
@@ -626,7 +632,7 @@ class SQLStateManager:
         """
         if source_email:
             rows = self._execute(
-                """
+                    """
                 SELECT file_id, dest_folder_id
                   FROM migration_items
                  WHERE migration_id      = %s
@@ -635,10 +641,10 @@ class SQLStateManager:
                    AND dest_folder_id IS NOT NULL
                 """,
                 (self.migration_id, source_email),
-            )
+                )
         else:
             rows = self._execute(
-                """
+                    """
                 SELECT file_id, dest_folder_id
                   FROM migration_items
                  WHERE migration_id    = %s
@@ -646,7 +652,7 @@ class SQLStateManager:
                    AND dest_folder_id IS NOT NULL
                 """,
                 (self.migration_id,),
-            )
+                )
         return {r["file_id"]: r["dest_folder_id"] for r in rows}
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -663,9 +669,9 @@ class SQLStateManager:
             return record.status
 
         row = self._one(
-            "SELECT status FROM migration_items WHERE migration_id=%s AND file_id=%s",
-            (self.migration_id, file_id),
-        )
+                "SELECT status FROM migration_items WHERE migration_id=%s AND file_id=%s",
+                (self.migration_id, file_id),
+                )
         if row:
             status = row["status"]
             if file_id in self._cache:
@@ -674,11 +680,11 @@ class SQLStateManager:
         return None
 
     def get_pending_items(
-        self,
-        run_id,
-        source_email: str = None,
-        item_types: tuple = ("file",),
-    ) -> List[Dict]:
+            self,
+            run_id,
+            source_email: str = None,
+            item_types: tuple = ("file",),
+            ) -> List[Dict]:
         """
         Return items that are PENDING or FAILED (for retry) as dicts.
         Called by migration_engine.py to get the work queue.
@@ -703,7 +709,7 @@ class SQLStateManager:
         if source_email:
             # FIX: My Drive engine filters by source_user_email
             rows = self._execute(
-                f"""
+                    f"""
                 SELECT file_id, file_name, mime_type, file_size,
                        parent_id, dest_folder_id, status,
                        source_user_email, destination_user_email,
@@ -715,11 +721,11 @@ class SQLStateManager:
                    {folder_filter}
                 """,
                 (self.migration_id, source_email) + folder_params,
-            )
+                )
         else:
             # FIX: Shared Drive engine — no user email filter
             rows = self._execute(
-                f"""
+                    f"""
                 SELECT file_id, file_name, mime_type, file_size,
                        parent_id, dest_folder_id, status,
                        source_user_email, destination_user_email,
@@ -730,7 +736,7 @@ class SQLStateManager:
                    {folder_filter}
                 """,
                 (self.migration_id,) + folder_params,
-            )
+                )
 
         # Cache and return as dicts compatible with migration_engine.py
         result = []
@@ -740,11 +746,13 @@ class SQLStateManager:
             result.append(rec.to_dict())
         return result
 
+
+
     def should_skip_item(self, file_id: str) -> Tuple[bool, str]:
         record = self._cache.get(file_id)
         if not record:
             row = self._one(
-                """
+                    """
                 SELECT status, mime_type,
                        source_user_email, destination_user_email,
                        drive_type, source_shared_drive_id, dest_shared_drive_id
@@ -752,7 +760,7 @@ class SQLStateManager:
                  WHERE migration_id=%s AND file_id=%s
                 """,
                 (self.migration_id, file_id),
-            )
+                )
             if row:
                 record = MigrationRecord({"file_id": file_id, **row})
                 self._cache[file_id] = record
@@ -765,19 +773,61 @@ class SQLStateManager:
             return True, "Non-migratable type"
         return False, ""
 
-    # ─────────────────────────────────────────────────────────────────────────
+
+
+    def get_all_pending_items(self, run_id) -> List["MigrationRecord"]:
+        """
+        GLOBAL QUEUE (Phase 2 of migration_engine.py v3):
+        Return ALL PENDING/FAILED items across every user/drive for this
+        migration run — no filter by source_user_email or shared_drive_id.
+
+        Returns MigrationRecord objects (not dicts) because migration_engine.py
+        accesses .file_id, .file_name, .mime_type, .file_size_bytes,
+        .source_email, .dest_email, .source_parent_id directly as attributes.
+        """
+        rows = self._execute(
+                """
+            SELECT file_id, file_name, mime_type, file_size,
+                   parent_id, dest_folder_id, status,
+                   source_user_email, destination_user_email,
+                   drive_type, source_shared_drive_id, dest_shared_drive_id
+              FROM migration_items
+             WHERE migration_id = %s
+               AND status IN ('PENDING', 'FAILED')
+               AND is_folder = 0
+            """,
+            (self.migration_id,),
+            )
+
+        records = []
+        for row in rows:
+            rec = MigrationRecord(row)
+            # migration_engine.py reads .source_email and .dest_email
+            # MigrationRecord stores these as .source_user_email / .dest_user_email
+            # Add the aliases migration_engine.py expects:
+            rec.source_email = rec.source_user_email
+            rec.dest_email   = rec.dest_user_email
+            self._cache[rec.file_id] = rec
+            records.append(rec)
+
+        logger.info(
+                f"get_all_pending_items: {len(records)} items across all users "
+                f"for migration_id={self.migration_id}"
+                )
+        return records
+# ─────────────────────────────────────────────────────────────────────────
     # migration_items  —  status transitions
     # ─────────────────────────────────────────────────────────────────────────
 
     def _set_status(self, file_id: str, status: str, error: str = ""):
         self._execute(
-            """
+                """
             UPDATE migration_items
                SET status=%, error_message=%s
              WHERE migration_id=%s AND file_id=%s
             """.replace("=%,", "=%s,"),   # avoid f-string for %
             (status, error[:65535], self.migration_id, file_id),
-        )
+            )
         if file_id in self._cache:
             self._cache[file_id].status = status
 
@@ -789,20 +839,20 @@ class SQLStateManager:
         """
         fid = file_id if file_id is not None else run_id_or_file_id
         self._execute(
-            "UPDATE migration_items SET status='IN_PROGRESS' "
-            "WHERE migration_id=%s AND file_id=%s",
-            (self.migration_id, fid),
-        )
+                "UPDATE migration_items SET status='IN_PROGRESS' "
+                "WHERE migration_id=%s AND file_id=%s",
+                (self.migration_id, fid),
+                )
         if fid in self._cache:
             self._cache[fid].status = "IN_PROGRESS"
 
     def mark_done(
-        self,
-        run_id_or_file_id,
-        file_id_or_dest_id=None,
-        dest_item_id: str = None,
-        dest_parent_id: str = None,
-    ):
+            self,
+            run_id_or_file_id,
+            file_id_or_dest_id=None,
+            dest_item_id: str = None,
+            dest_parent_id: str = None,
+            ):
         """
         Supports:
           migration_engine.py:  mark_done(run_id, file_id, dest_item_id=x, dest_parent_id=y)
@@ -818,7 +868,7 @@ class SQLStateManager:
             dest_id = file_id_or_dest_id
 
         self._execute(
-            """
+                """
             UPDATE migration_items
                SET status='DONE',
                    dest_folder_id=COALESCE(%s, dest_folder_id),
@@ -826,7 +876,7 @@ class SQLStateManager:
              WHERE migration_id=%s AND file_id=%s
             """,
             (dest_id, self.migration_id, fid),
-        )
+            )
         if fid in self._cache:
             self._cache[fid].status = "DONE"
             if dest_id:
@@ -838,11 +888,11 @@ class SQLStateManager:
         self.mark_done(file_id, dest_file_id)
 
     def mark_failed(
-        self,
-        run_id_or_file_id,
-        file_id_or_error=None,
-        error_message: str = "",
-    ):
+            self,
+            run_id_or_file_id,
+            file_id_or_error=None,
+            error_message: str = "",
+            ):
         """
         Supports:
           migration_engine.py:  mark_failed(run_id, file_id, error_message)
@@ -858,7 +908,7 @@ class SQLStateManager:
             err = file_id_or_error or ""
 
         self._execute(
-            """
+                """
             UPDATE migration_items
                SET status='FAILED',
                    error_message=%s,
@@ -866,7 +916,7 @@ class SQLStateManager:
              WHERE migration_id=%s AND file_id=%s
             """,
             (str(err)[:65535], self.migration_id, fid),
-        )
+            )
         if fid in self._cache:
             self._cache[fid].status = "FAILED"
         self.update_run_counters(failed=1)
@@ -876,11 +926,11 @@ class SQLStateManager:
         self.mark_failed(file_id, error_message)
 
     def mark_ignored(
-        self,
-        run_id_or_file_id,
-        file_id_or_reason=None,
-        reason: str = "",
-    ):
+            self,
+            run_id_or_file_id,
+            file_id_or_reason=None,
+            reason: str = "",
+            ):
         """
         Supports:
           migration_engine.py:  mark_ignored(run_id, file_id, reason)
@@ -894,26 +944,26 @@ class SQLStateManager:
             reason_str = file_id_or_reason or ""
 
         self._execute(
-            """
+                """
             UPDATE migration_items
                SET status='IGNORED', error_message=%s
              WHERE migration_id=%s AND file_id=%s
             """,
             (str(reason_str)[:65535], self.migration_id, fid),
-        )
+            )
         if fid in self._cache:
             self._cache[fid].status = "IGNORED"
         self.update_run_counters(ignored=1)
 
     def mark_skipped(self, file_id: str, reason: str = ""):
         self._execute(
-            """
+                """
             UPDATE migration_items
                SET status='SKIPPED', error_message=%s
              WHERE migration_id=%s AND file_id=%s
             """,
             (reason[:65535], self.migration_id, file_id),
-        )
+            )
         if file_id in self._cache:
             self._cache[file_id].status = "SKIPPED"
         self.update_run_counters(skipped=1)
@@ -943,19 +993,19 @@ class SQLStateManager:
             logger.warning("load_user_items() called in SHARED_DRIVE mode")
 
         rows = self._execute(
-            self._SELECT_COLS +
-            " WHERE migration_id=%s AND source_user_email=%s",
-            (self.migration_id, source_email),
-        )
+                self._SELECT_COLS +
+                " WHERE migration_id=%s AND source_user_email=%s",
+                (self.migration_id, source_email),
+                )
         self._load_cache(rows)
         logger.debug(f"load_user_items: {len(rows)} records for {source_email}")
         return [self._cache[r["file_id"]] for r in rows]
 
     def load_drive_items(
-        self,
-        source_shared_drive_id: str = None,
-        dest_shared_drive_id: str   = None,
-    ) -> List[MigrationRecord]:
+            self,
+            source_shared_drive_id: str = None,
+            dest_shared_drive_id: str   = None,
+            ) -> List[MigrationRecord]:
         """
         SHARED DRIVE engine: load all items for a specific drive pair.
         FIX: filters on source_shared_drive_id + dest_shared_drive_id.
@@ -968,26 +1018,26 @@ class SQLStateManager:
 
         if not src_drv or not dst_drv:
             raise ValueError(
-                f"load_drive_items requires drive IDs. Got src={src_drv!r} dst={dst_drv!r}"
-            )
+                    f"load_drive_items requires drive IDs. Got src={src_drv!r} dst={dst_drv!r}"
+                    )
 
         rows = self._execute(
-            self._SELECT_COLS +
-            " WHERE migration_id=%s"
-            "   AND source_shared_drive_id=%s"
-            "   AND dest_shared_drive_id=%s",
-            (self.migration_id, src_drv, dst_drv),
-        )
+                self._SELECT_COLS +
+                " WHERE migration_id=%s"
+                "   AND source_shared_drive_id=%s"
+                "   AND dest_shared_drive_id=%s",
+                (self.migration_id, src_drv, dst_drv),
+                )
         self._load_cache(rows)
         logger.debug(f"load_drive_items: {len(rows)} records for {src_drv}")
         return list(self._cache.values())
 
     def load_items(
-        self,
-        source_email: str           = None,
-        source_shared_drive_id: str = None,
-        dest_shared_drive_id: str   = None,
-    ) -> List[MigrationRecord]:
+            self,
+            source_email: str           = None,
+            source_shared_drive_id: str = None,
+            dest_shared_drive_id: str   = None,
+            ) -> List[MigrationRecord]:
         """Convenience dispatcher — routes to the correct load method."""
         src_drv = _s(source_shared_drive_id) or self.source_shared_drive_id
         dst_drv = _s(dest_shared_drive_id)   or self.dest_shared_drive_id
@@ -1004,7 +1054,7 @@ class SQLStateManager:
 
     def get_checkpoint_summary(self) -> Dict:
         row = self._one(
-            """
+                """
             SELECT COUNT(*) AS total,
                    SUM(status='DONE')        AS done,
                    SUM(status='FAILED')      AS failed,
@@ -1015,34 +1065,34 @@ class SQLStateManager:
               FROM migration_items WHERE migration_id=%s
             """,
             (self.migration_id,),
-        ) or {}
+            ) or {}
         return {
-            "migration_id":   self.migration_id,
-            "mode":           self._drive_type,
-            "total":          int(row.get("total") or 0),
-            "done":           int(row.get("done") or 0),
-            "failed":         int(row.get("failed") or 0),
-            "pending":        int(row.get("pending") or 0),
-            "skipped":        int(row.get("skipped") or 0),
-            "ignored":        int(row.get("ignored") or 0),
-            "in_progress":    int(row.get("in_progress") or 0),
-            "completion_percentage": 0.0,  # compat field
-            "status_breakdown": {
-                "pending":     int(row.get("pending") or 0),
-                "done":        int(row.get("done") or 0),
-                "failed":      int(row.get("failed") or 0),
-            },
-        }
+                "migration_id":   self.migration_id,
+                "mode":           self._drive_type,
+                "total":          int(row.get("total") or 0),
+                "done":           int(row.get("done") or 0),
+                "failed":         int(row.get("failed") or 0),
+                "pending":        int(row.get("pending") or 0),
+                "skipped":        int(row.get("skipped") or 0),
+                "ignored":        int(row.get("ignored") or 0),
+                "in_progress":    int(row.get("in_progress") or 0),
+                "completion_percentage": 0.0,  # compat field
+                "status_breakdown": {
+                    "pending":     int(row.get("pending") or 0),
+                    "done":        int(row.get("done") or 0),
+                    "failed":      int(row.get("failed") or 0),
+                    },
+                }
 
     def get_drive_checkpoint_summary(
-        self,
-        source_shared_drive_id: str = None,
-        dest_shared_drive_id: str   = None,
-    ) -> Dict:
+            self,
+            source_shared_drive_id: str = None,
+            dest_shared_drive_id: str   = None,
+            ) -> Dict:
         src_drv = _s(source_shared_drive_id) or self.source_shared_drive_id
         dst_drv = _s(dest_shared_drive_id)   or self.dest_shared_drive_id
         row = self._one(
-            """
+                """
             SELECT COUNT(*) AS total,
                    SUM(status='DONE')        AS done,
                    SUM(status='FAILED')      AS failed,
@@ -1056,16 +1106,16 @@ class SQLStateManager:
                AND dest_shared_drive_id=%s
             """,
             (self.migration_id, src_drv, dst_drv),
-        ) or {}
+            ) or {}
         return {k: int(v or 0) for k, v in row.items()} | {
-            "migration_id": self.migration_id,
-            "source_shared_drive_id": src_drv,
-            "dest_shared_drive_id":   dst_drv,
-        }
+                "migration_id": self.migration_id,
+                "source_shared_drive_id": src_drv,
+                "dest_shared_drive_id":   dst_drv,
+                }
 
     def get_user_checkpoint_summary(self, source_email: str) -> Dict:
         row = self._one(
-            """
+                """
             SELECT COUNT(*) AS total,
                    SUM(status='DONE')        AS done,
                    SUM(status='FAILED')      AS failed,
@@ -1077,38 +1127,38 @@ class SQLStateManager:
              WHERE migration_id=%s AND source_user_email=%s
             """,
             (self.migration_id, source_email),
-        ) or {}
+            ) or {}
         return {k: int(v or 0) for k, v in row.items()} | {
-            "migration_id": self.migration_id,
-            "source_email": source_email,
-        }
+                "migration_id": self.migration_id,
+                "source_email": source_email,
+                }
 
     def print_summary(self):
         s = self.get_checkpoint_summary()
         logger.info(
-            f"[SQL] id={s['migration_id']} mode={s['mode']} "
-            f"total={s['total']} done={s['done']} failed={s['failed']} "
-            f"pending={s['pending']} ignored={s['ignored']}"
-        )
+                f"[SQL] id={s['migration_id']} mode={s['mode']} "
+                f"total={s['total']} done={s['done']} failed={s['failed']} "
+                f"pending={s['pending']} ignored={s['ignored']}"
+                )
 
     # ─────────────────────────────────────────────────────────────────────────
     # migration_permissions
     # ─────────────────────────────────────────────────────────────────────────
 
     def upsert_permission(
-        self,
-        file_id: str,
-        item_type: str,
-        permission_type: str,
-        source_email: str,
-        dest_email: str,
-        role: str,
-        classification: str,
-        is_inherited: bool = False,
-        parent_drive_id: str = None,
-    ):
+            self,
+            file_id: str,
+            item_type: str,
+            permission_type: str,
+            source_email: str,
+            dest_email: str,
+            role: str,
+            classification: str,
+            is_inherited: bool = False,
+            parent_drive_id: str = None,
+            ):
         self._execute(
-            """
+                """
             INSERT IGNORE INTO migration_permissions
                 (migration_id, file_id, item_type, parent_drive_id,
                 permission_type, source_email, destination_email,
@@ -1120,25 +1170,25 @@ class SQLStateManager:
                 parent_drive_id or "",
                 permission_type, source_email or "", dest_email or "",
                 role, classification, int(is_inherited),
-            ),
-        )
+                ),
+            )
 
     def mark_permission_done(self, file_id: str, dest_email: str, role: str):
         self._execute(
-            """
+                """
             UPDATE migration_permissions
             SET status='DONE', updated_at=NOW()
             WHERE migration_id=%s AND file_id=%s
             AND destination_email=%s AND role=%s
             """,
             (self.migration_id, file_id, dest_email, role),
-        )
+            )
 
     def mark_permission_failed(
-        self, file_id: str, dest_email: str, role: str, error: str
-    ):
+            self, file_id: str, dest_email: str, role: str, error: str
+            ):
         self._execute(
-            """
+                """
             UPDATE migration_permissions
             SET status='FAILED',
                 error_message=%s,
@@ -1148,20 +1198,20 @@ class SQLStateManager:
             AND destination_email=%s AND role=%s
             """,
             (error[:65535], self.migration_id, file_id, dest_email, role),
-        )
+            )
 
     # ─────────────────────────────────────────────────────────────────────────
     # shared_drive_members
     # ─────────────────────────────────────────────────────────────────────────
 
     def upsert_shared_drive_member(
-        self,
-        source_drive_id: str,
-        dest_drive_id: str,
-        member_email: str,
-        member_type: str,
-        role: str,
-    ):
+            self,
+            source_drive_id: str,
+            dest_drive_id: str,
+            member_email: str,
+            member_type: str,
+            role: str,
+            ):
         if role == "owner":
             logger.debug(f"Skipping 'owner' role for {member_email} — not in ENUM")
             return
@@ -1173,43 +1223,43 @@ class SQLStateManager:
         dst_drv = _s(dest_drive_id)
         if not src_drv or not dst_drv:
             raise ValueError(
-                f"upsert_shared_drive_member needs non-empty drive IDs. "
-                f"src={source_drive_id!r} dst={dest_drive_id!r}"
-            )
+                    f"upsert_shared_drive_member needs non-empty drive IDs. "
+                    f"src={source_drive_id!r} dst={dest_drive_id!r}"
+                    )
 
         self._execute(
-            """
+                """
             INSERT IGNORE INTO shared_drive_members
                 (migration_id, source_drive_id, dest_shared_drive_id,
                  member_email, member_type, role, status)
             VALUES (%s,%s,%s,%s,%s,%s,'PENDING')
             """,
             (self.migration_id, src_drv, dst_drv, member_email, member_type, role),
-        )
+            )
 
     def mark_member_done(self, dest_drive_id: str, member_email: str, role: str):
         self._execute(
-            """
+                """
             UPDATE shared_drive_members
                SET status='DONE'
              WHERE migration_id=%s AND dest_shared_drive_id=%s
                AND member_email=%s AND role=%s
             """,
             (self.migration_id, dest_drive_id, member_email, role),
-        )
+            )
 
     def mark_member_failed(
-        self, dest_drive_id: str, member_email: str, role: str, error: str
-    ):
+            self, dest_drive_id: str, member_email: str, role: str, error: str
+            ):
         self._execute(
-            """
+                """
             UPDATE shared_drive_members
                SET status='FAILED', error_message=%s, retry_count=retry_count+1
              WHERE migration_id=%s AND dest_shared_drive_id=%s
                AND member_email=%s AND role=%s
             """,
             (error[:65535], self.migration_id, dest_drive_id, member_email, role),
-        )
+            )
 
     # ─────────────────────────────────────────────────────────────────────────
     # GCS staging helpers
@@ -1225,15 +1275,15 @@ class SQLStateManager:
     # ── High-level Drive ↔ GCS helpers used by migration_engine.py ────────────
 
     def download_drive_to_gcs(
-        self,
-        drive_svc,
-        file_id: str,
-        file_name: str,
-        run_id,
-        mime_type: str,
-        export_mime: str = None,
-        chunk_size_bytes: int = 20 * 1024 * 1024,
-    ) -> Tuple[bool, Optional[str], Optional[str]]:
+            self,
+            drive_svc,
+            file_id: str,
+            file_name: str,
+            run_id,
+            mime_type: str,
+            export_mime: str = None,
+            chunk_size_bytes: int = 20 * 1024 * 1024,
+            ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Download a file from Drive (or export a Workspace file) and stream
         directly to GCS.  Returns (ok, blob_name, error_message).
@@ -1251,12 +1301,12 @@ class SQLStateManager:
         try:
             if export_mime:
                 request = drive_svc.files().export_media(
-                    fileId=file_id, mimeType=export_mime
-                )
+                        fileId=file_id, mimeType=export_mime
+                        )
             else:
                 request = drive_svc.files().get_media(
-                    fileId=file_id, supportsAllDrives=True
-                )
+                        fileId=file_id, supportsAllDrives=True
+                        )
 
             buf      = io.BytesIO()
             dl       = MediaIoBaseDownload(buf, request, chunksize=chunk_size_bytes)
@@ -1271,9 +1321,9 @@ class SQLStateManager:
             buf.seek(0)
             blob = self._bucket.blob(blob_name)
             blob.upload_from_file(
-                buf,
-                content_type=export_mime or mime_type or "application/octet-stream",
-            )
+                    buf,
+                    content_type=export_mime or mime_type or "application/octet-stream",
+                    )
             logger.debug(f"GCS ↑ {blob_name}")
             return True, blob_name, None
 
@@ -1283,15 +1333,15 @@ class SQLStateManager:
             return False, None, err
 
     def upload_gcs_to_drive(
-        self,
-        drive_svc,
-        blob_name: str,
-        file_name: str,
-        mime_type: str,
-        parent_id: Optional[str],
-        import_mime: str = None,
-        chunk_size_bytes: int = 20 * 1024 * 1024,
-    ) -> Tuple[bool, Optional[str], Optional[str]]:
+            self,
+            drive_svc,
+            blob_name: str,
+            file_name: str,
+            mime_type: str,
+            parent_id: Optional[str],
+            import_mime: str = None,
+            chunk_size_bytes: int = 20 * 1024 * 1024,
+            ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
         Download blob from GCS and upload to destination Drive.
         Returns (ok, dest_file_id, error_message).
@@ -1307,15 +1357,15 @@ class SQLStateManager:
                 meta["mimeType"] = import_mime
 
             media = MediaIoBaseUpload(
-                io.BytesIO(data),
-                mimetype=mime_type,
-                resumable=True,
-                chunksize=chunk_size_bytes,
-            )
+                    io.BytesIO(data),
+                    mimetype=mime_type,
+                    resumable=True,
+                    chunksize=chunk_size_bytes,
+                    )
             f = drive_svc.files().create(
-                body=meta, media_body=media,
-                fields="id", supportsAllDrives=True,
-            ).execute()
+                    body=meta, media_body=media,
+                    fields="id", supportsAllDrives=True,
+                    ).execute()
             return True, f["id"], None
 
         except Exception as exc:
@@ -1347,9 +1397,9 @@ class SQLStateManager:
         return f"{self.gcs_prefix}{self.migration_id}/{file_id}"
 
     def upload_to_gcs(
-        self, file_id: str, data: bytes,
-        content_type: str = "application/octet-stream",
-    ) -> str:
+            self, file_id: str, data: bytes,
+            content_type: str = "application/octet-stream",
+            ) -> str:
         key  = self._gcs_key(file_id)
         blob = self._bucket.blob(key)
         blob.upload_from_string(data, content_type=content_type)
