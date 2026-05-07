@@ -149,9 +149,24 @@ class GoogleAuthManager:
         return build('admin', 'directory_v1', credentials=self.creds)
 
     def get_credentials(self):
-        """Return the raw delegated credentials object."""
-        return self.credentials   # or self._credentials, self.creds — whatever attr holds them
-    
+        """
+        Return the raw delegated credentials object so callers can inject a
+        custom httplib2.Http transport (e.g. with timeout=1800).
+
+        _build_drive_service() in migration_engine calls:
+            creds           = user_auth.get_credentials()
+            http            = httplib2.Http(timeout=1800)
+            authorized_http = creds.authorize(http)
+            return build('drive', 'v3', http=authorized_http)
+
+        For service accounts with per-user delegation, we must return
+        credentials already scoped to the delegate_email so that
+        creds.authorize() produces the correct impersonated token.
+        """
+        if not self.creds:
+            self.authenticate()
+        return self.creds  # FIX: was self.credentials (AttributeError) — correct attr is self.creds
+
     # ============================================================================
     # GCS BUCKET AUTH
     # ============================================================================

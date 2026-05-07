@@ -1,37 +1,51 @@
 """
-shared_drive_migrator.py  (v3 – Global Queue + GCS/Memory routing)
+shared_drive_migrator.py  (v4 – Temporary Admin Membership)
 
-PATCH CHANGES vs v2:
+PATCH CHANGES vs v3:
   1. TWO-PHASE ARCHITECTURE (mirrors migration_engine.py v3):
        Phase 1 — Discovery: list files, build folder structure, register items in SQL.
                  Runs per-drive in parallel (DISCOVERY_WORKERS drives at once).
        Phase 2 — Global Queue: flat ThreadPoolExecutor drains ALL pending files
                  from SQL across all drives simultaneously (GLOBAL_WORKERS).
-                 Previously each drive ran its own sequential/per-drive pool,
-                 meaning idle workers while one large drive blocked the rest.
 
   2. GCS / MEMORY ROUTING (mirrors migration_engine.py):
        _migrate_one_file_v3() replaces the old _migrate_one_file():
          - file_size < 50 MB  → _migrate_via_memory()   (BytesIO, direct upload)
          - file_size >= 50 MB → _migrate_via_gcs()       (stream through GCS bucket)
-       Both paths use mgr.download_drive_to_gcs() / mgr.upload_gcs_to_drive() for
-       the GCS path — same helpers migration_engine.py uses.
 
-  3. PERMISSION LOGIC UNCHANGED:
+  3. TEMPORARY ADMIN MEMBERSHIP (NEW in v4):
+       Problem: Source domain admin may not be a member of every Shared Drive,
+                causing 404/403 errors when listing files or accessing the drive.
+       Solution:
+         _ensure_admin_access(drive_id, drive_name):
+           - Checks whether the admin service account IS already a member of the
+             source Shared Drive.
+           - If YES → records was_temporary=False, does nothing.
+           - If NO  → adds admin as 'organizer' (temporary), records
+                      was_temporary=True, so it can be cleaned up later.
+         _revoke_admin_access(drive_id, drive_name, permission_id):
+           - Removes the temporary permission added above.
+           - Called in a `finally` block inside migrate_all_shared_drives() so
+             cleanup always runs, even if the drive migration throws.
+         IMPORTANT: Only the drive-level temporary membership is added/removed.
+                    File-level permissions are NEVER modified — existing file
+                    shares are not touched, and the admin is not granted access
+                    to individual files that were not already shared with it.
+
+  4. PERMISSION LOGIC UNCHANGED:
        _migrate_item_permissions() — not touched.
        migrate_drive_members()     — not touched.
-       migrate_all_shared_drives() — structure preserved; phase wiring added.
 
-  4. FOLDER BUILDING UNCHANGED:
+  5. FOLDER BUILDING UNCHANGED:
        _build_shared_drive_folder_structure() — not touched.
        _create_folder_in_shared_drive()       — not touched.
        _sort_folders_by_hierarchy()           — not touched.
 
-  5. SQL INTERFACE UNCHANGED:
-       All mgr.* calls identical to v2 — no new methods required from
+  6. SQL INTERFACE UNCHANGED:
+       All mgr.* calls identical to v3 — no new methods required from
        sql_state_manager.py or main.py.
 
-CONSTRUCTOR SIGNATURE: unchanged from v2.
+CONSTRUCTOR SIGNATURE: unchanged from v3.
     SharedDriveMigrator(source_admin_drive, dest_admin_drive,
                         source_domain, dest_domain, config,
                         sql_mgr, run_id, parallel_files)
@@ -90,9 +104,17 @@ class SharedDriveMigrator:
     """
     Handles Shared Drive → Shared Drive migration.
 
-    Two-phase architecture (v3):
+    Two-phase architecture (v3+):
       Phase 1 — per-drive discovery + folder creation (parallel drives).
       Phase 2 — global file queue drained by a flat thread pool.
+
+    v4 addition — Temporary Admin Membership:
+      Before Phase 1 for each drive, _ensure_admin_access() checks whether the
+      source admin service account is already a member of the source Shared Drive.
+      If not, it is added temporarily as 'organizer' so that all Drive API calls
+      (list, get_media, permissions.list, etc.) succeed.  After migration of that
+      drive completes (success or failure), _revoke_admin_access() removes the
+      temporary permission.  File-level permissions are never touched.
 
     Key differences from My Drive:
       - Ownership lives at drive level, not per-file
@@ -106,10 +128,10 @@ class SharedDriveMigrator:
     dest_admin_drive    : Drive service authenticated as dest domain admin
     source_domain       : str  e.g. 'dev.shivaami.in'
     dest_domain         : str  e.g. 'demo.shivaami.in'
-    config              : Config object
+    config              : Config object  (must expose config.source_admin_email)
     sql_mgr             : SQLStateManager instance (checkpoint + GCS helper)
     run_id              : int / str — current migration_runs.migration_id
-    parallel_files      : int — ignored in v3 (GLOBAL_WORKERS used instead),
+    parallel_files      : int — ignored in v3+ (GLOBAL_WORKERS used instead),
                           kept for constructor compatibility
     """
 
@@ -133,23 +155,172 @@ class SharedDriveMigrator:
         self.run_id         = run_id
         self.parallel_files = parallel_files   # kept for compat
 
+        # Resolve the admin email used for temporary membership checks.
+        # Tries config.source_admin_email first, falls back to
+        # config.admin_email, then None (graceful degradation).
+        self._admin_email: Optional[str] = (
+            getattr(config, "source_admin_email", None)
+            or getattr(config, "admin_email", None)
+        )
+
         self.stats = {
-            "drives_total":     0,
-            "drives_created":   0,
-            "drives_failed":    0,
-            "files_migrated":   0,
-            "files_failed":     0,
-            "files_skipped":    0,
-            "files_ignored":    0,
-            "folders_created":  0,
-            "members_migrated": 0,
-            "members_failed":   0,
-            "gcs_routed":       0,
-            "memory_routed":    0,
+            "drives_total":       0,
+            "drives_created":     0,
+            "drives_failed":      0,
+            "files_migrated":     0,
+            "files_failed":       0,
+            "files_skipped":      0,
+            "files_ignored":      0,
+            "folders_created":    0,
+            "members_migrated":   0,
+            "members_failed":     0,
+            "gcs_routed":         0,
+            "memory_routed":      0,
+            "temp_memberships":   0,   # NEW: drives where admin was added temporarily
         }
 
         # {source_drive_id: {source_folder_id: dest_folder_id}}
         self._folder_maps: Dict[str, Dict[str, str]] = {}
+
+    # =========================================================================
+    # STEP 0 (NEW v4): Temporary admin membership helpers
+    # =========================================================================
+
+    def _ensure_admin_access(
+        self,
+        drive_id: str,
+        drive_name: str,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Ensure the source admin account can access this Shared Drive.
+
+        Returns
+        ───────
+        (was_temporary, permission_id)
+          was_temporary=False, permission_id=None   → admin already a member
+          was_temporary=True,  permission_id=<str>  → admin added temporarily
+          was_temporary=False, permission_id=None   → check failed / no email
+                                                       configured (caller logs)
+
+        Strategy
+        ────────
+        1. List current drive-level permissions with useDomainAdminAccess=True.
+        2. If the admin email appears in any permission → already a member,
+           return (False, None).  Do NOT change anything.
+        3. Otherwise → add admin as 'organizer' and return (True, new_perm_id).
+           The 'organizer' role gives full read/write access needed for migration
+           without making the admin an owner.
+
+        File-level permissions are NEVER inspected or modified here.
+        """
+        if not self._admin_email:
+            logger.warning(
+                f"[TEMP-MEMBERSHIP] No admin email configured — "
+                f"skipping membership check for '{drive_name}' ({drive_id}). "
+                "Set config.source_admin_email to enable automatic temporary membership."
+            )
+            return False, None
+
+        # ── Step 1: Check existing membership ────────────────────────────────
+        try:
+            resp = self.source_drive.permissions().list(
+                fileId=drive_id,
+                supportsAllDrives=True,
+                useDomainAdminAccess=True,
+                fields="permissions(id,emailAddress,type,role)",
+            ).execute()
+            existing_perms = resp.get("permissions", [])
+        except HttpError as exc:
+            logger.error(
+                f"[TEMP-MEMBERSHIP] Cannot list permissions for '{drive_name}': {exc}"
+            )
+            return False, None
+
+        admin_lower = self._admin_email.lower()
+        for perm in existing_perms:
+            perm_email = (perm.get("emailAddress") or "").lower()
+            if perm_email == admin_lower:
+                logger.debug(
+                    f"[TEMP-MEMBERSHIP] Admin '{self._admin_email}' already a member "
+                    f"of '{drive_name}' with role='{perm.get('role')}' — no change."
+                )
+                return False, None   # already a member, nothing to do
+
+        # ── Step 2: Admin is NOT a member — add temporarily ──────────────────
+        logger.info(
+            f"[TEMP-MEMBERSHIP] Admin '{self._admin_email}' is NOT a member of "
+            f"'{drive_name}' ({drive_id}) — adding temporary 'organizer' permission."
+        )
+        try:
+            new_perm = self.source_drive.permissions().create(
+                fileId=drive_id,
+                supportsAllDrives=True,
+                useDomainAdminAccess=True,
+                sendNotificationEmail=False,
+                body={
+                    "type":         "user",
+                    "role":         "organizer",
+                    "emailAddress": self._admin_email,
+                },
+                fields="id",
+            ).execute()
+
+            perm_id = new_perm.get("id")
+            if perm_id:
+                logger.info(
+                    f"[TEMP-MEMBERSHIP] ✓ Temporary organizer added to '{drive_name}' "
+                    f"(permissionId={perm_id})"
+                )
+                self.stats["temp_memberships"] += 1
+                return True, perm_id
+            else:
+                logger.warning(
+                    f"[TEMP-MEMBERSHIP] Permission create returned no id for '{drive_name}'"
+                )
+                return False, None
+
+        except HttpError as exc:
+            logger.error(
+                f"[TEMP-MEMBERSHIP] Failed to add admin to '{drive_name}': {exc}"
+            )
+            return False, None
+
+    def _revoke_admin_access(
+        self,
+        drive_id: str,
+        drive_name: str,
+        permission_id: str,
+    ) -> None:
+        """
+        Remove the temporary admin permission added by _ensure_admin_access().
+
+        Called in a `finally` block so cleanup always runs regardless of whether
+        migration succeeded or failed.  File-level permissions are not touched.
+        """
+        if not permission_id:
+            return
+
+        logger.info(
+            f"[TEMP-MEMBERSHIP] Removing temporary permission '{permission_id}' "
+            f"from '{drive_name}' ({drive_id})..."
+        )
+        try:
+            self.source_drive.permissions().delete(
+                fileId=drive_id,
+                permissionId=permission_id,
+                supportsAllDrives=True,
+                useDomainAdminAccess=True,
+            ).execute()
+            logger.info(
+                f"[TEMP-MEMBERSHIP] ✓ Temporary membership removed from '{drive_name}'"
+            )
+        except HttpError as exc:
+            # Log but do not raise — we never want cleanup to mask migration errors.
+            logger.warning(
+                f"[TEMP-MEMBERSHIP] Could not remove temp permission from "
+                f"'{drive_name}' (permissionId={permission_id}): {exc} — "
+                "you may need to remove it manually."
+            )
 
     # =========================================================================
     # STEP 1: List all Shared Drives in source domain
@@ -271,7 +442,7 @@ class SharedDriveMigrator:
         return files
 
     # =========================================================================
-    # STEP 4: Migrate drive-level members — UNCHANGED from v2
+    # STEP 4: Migrate drive-level members — UNCHANGED from v3
     # =========================================================================
 
     def migrate_drive_members(
@@ -365,7 +536,7 @@ class SharedDriveMigrator:
         return source_email
 
     # =========================================================================
-    # STEP 5: Folder structure builder — UNCHANGED from v2
+    # STEP 5: Folder structure builder — UNCHANGED from v3
     # =========================================================================
 
     def _build_shared_drive_folder_structure(
@@ -510,7 +681,7 @@ class SharedDriveMigrator:
         return result
 
     # =========================================================================
-    # STEP 6: Item permissions — UNCHANGED from v2
+    # STEP 6: Item permissions — UNCHANGED from v3
     # =========================================================================
 
     def _migrate_item_permissions(
@@ -526,6 +697,11 @@ class SharedDriveMigrator:
         1. Fetch permissions from source API (always fresh)
         2. Apply to destination via EnhancedPermissionsMigrator
         3. Track each result in migration_permissions SQL table
+
+        NOTE: This method is only called for files/folders that already have
+        explicit permissions beyond drive-level membership. The admin's temporary
+        drive-level membership does NOT cause the admin to appear in per-file
+        permission lists, so no admin permission is accidentally propagated here.
         """
         try:
             resp = self.source_drive.permissions().list(
@@ -829,8 +1005,8 @@ class SharedDriveMigrator:
         empty      = {"success": False, "dest_id": None, "ignored": False, "error": None}
         last_error = ""
 
-        export_info      = GOOGLE_WORKSPACE_EXPORT.get(mime_type)
-        is_workspace     = export_info is not None
+        export_info  = GOOGLE_WORKSPACE_EXPORT.get(mime_type)
+        is_workspace = export_info is not None
 
         # Non-exportable workspace types (folder etc.)
         if mime_type == "application/vnd.google-apps.folder":
@@ -1102,7 +1278,7 @@ class SharedDriveMigrator:
         return {**empty, "error": last_error}
 
     # =========================================================================
-    # MAIN: Migrate all (or filtered) Shared Drives — two-phase
+    # MAIN: Migrate all (or filtered) Shared Drives — two-phase + temp membership
     # =========================================================================
 
     def migrate_all_shared_drives(
@@ -1112,6 +1288,16 @@ class SharedDriveMigrator:
     ) -> Dict:
         """
         Main entry point for Shared Drive migration.
+
+        v4 change — Temporary Admin Membership:
+          For EACH drive triple (src_id, dst_id, drive_name):
+            1. _ensure_admin_access(src_id, drive_name) is called BEFORE any
+               Drive API calls against that drive.
+            2. If the admin was added temporarily (was_temporary=True), the
+               permission_id is stored in `temp_perms`.
+            3. After migration of that drive finishes (success OR failure),
+               _revoke_admin_access() is called inside a `finally` block.
+          File-level permissions are NEVER modified during this process.
 
         Phase 1 — Discovery (parallel per drive):
           • List files, register in SQL, build folder hierarchy.
@@ -1127,16 +1313,17 @@ class SharedDriveMigrator:
             drive_id_mapping : optional {source_drive_id: dest_drive_id} from CSV.
         """
         summary = {
-            "total_drives":           0,
-            "drives_migrated":        0,
-            "drives_failed":          0,
-            "total_files_migrated":   0,
-            "total_files_failed":     0,
-            "total_files_ignored":    0,
-            "total_files_skipped":    0,
-            "total_folders_created":  0,
-            "total_members_migrated": 0,
-            "drive_results":          [],
+            "total_drives":             0,
+            "drives_migrated":          0,
+            "drives_failed":            0,
+            "total_files_migrated":     0,
+            "total_files_failed":       0,
+            "total_files_ignored":      0,
+            "total_files_skipped":      0,
+            "total_folders_created":    0,
+            "total_members_migrated":   0,
+            "total_temp_memberships":   0,   # NEW: count of drives needing temp access
+            "drive_results":            [],
         }
 
         # ── Resolve the list of (src_id, dst_id, drive_name) triples ─────────
@@ -1198,6 +1385,28 @@ class SharedDriveMigrator:
         if not drive_triples:
             logger.warning("No drives available for migration after setup.")
             return summary
+
+        # ── NEW v4: Ensure admin access for each source drive ─────────────────
+        # temp_perms maps src_id → permission_id (or None if no temp perm needed)
+        # We resolve membership BEFORE any per-drive work starts.
+        # Cleanup (revocation) happens in a per-drive finally block below.
+        temp_perms: Dict[str, Optional[str]] = {}
+
+        logger.info(
+            f"[TEMP-MEMBERSHIP] Checking admin membership for "
+            f"{len(drive_triples)} source drive(s)..."
+        )
+        for src_id, dst_id, drive_name in drive_triples:
+            was_temp, perm_id = self._ensure_admin_access(src_id, drive_name)
+            temp_perms[src_id] = perm_id if was_temp else None
+
+        temp_count = sum(1 for p in temp_perms.values() if p is not None)
+        summary["total_temp_memberships"] = temp_count
+        if temp_count:
+            logger.info(
+                f"[TEMP-MEMBERSHIP] Temporary access granted for {temp_count} drive(s). "
+                "Will revoke after each drive completes."
+            )
 
         # ── Step: migrate drive-level members for all drives (serial) ─────────
         # Done before Phase 1 so members exist before any file permissions land.
@@ -1287,19 +1496,37 @@ class SharedDriveMigrator:
                         ),
                     }
 
+        # ── NEW v4: Revoke temporary admin permissions ────────────────────────
+        # Done AFTER Phase 2 so admin access is present for the entire migration.
+        # Each revocation is wrapped in try/finally so one failure does not
+        # prevent the others from running.
+        logger.info("[TEMP-MEMBERSHIP] Revoking temporary drive memberships...")
+        for src_id, dst_id, drive_name in drive_triples:
+            perm_id = temp_perms.get(src_id)
+            if perm_id:
+                try:
+                    self._revoke_admin_access(src_id, drive_name, perm_id)
+                except Exception as exc:
+                    # Already logged inside _revoke_admin_access; belt-and-suspenders.
+                    logger.warning(
+                        f"[TEMP-MEMBERSHIP] Revocation outer exception for "
+                        f"'{drive_name}': {exc}"
+                    )
+
         # ── Aggregate results per drive ────────────────────────────────────────
         per_drive: Dict[str, Dict] = {
             src_id: {
-                "name":            drive_name,
-                "source_id":       src_id,
-                "dest_id":         dst_id,
-                "status":          "failed",
-                "files_migrated":  0,
-                "files_failed":    0,
-                "files_skipped":   0,
-                "files_ignored":   0,
-                "folders_created": disc_results.get(src_id, {}).get("folders_created", 0),
+                "name":             drive_name,
+                "source_id":        src_id,
+                "dest_id":          dst_id,
+                "status":           "failed",
+                "files_migrated":   0,
+                "files_failed":     0,
+                "files_skipped":    0,
+                "files_ignored":    0,
+                "folders_created":  disc_results.get(src_id, {}).get("folders_created", 0),
                 "members_migrated": member_results.get(src_id, {}).get("migrated", 0),
+                "temp_membership":  temp_perms.get(src_id) is not None,   # NEW
             }
             for src_id, dst_id, drive_name in drive_triples
         }
@@ -1351,8 +1578,9 @@ class SharedDriveMigrator:
             summary["drive_results"].append(agg)
 
             icon = "✓" if agg["status"] == "completed" else "✗"
+            temp_tag = " [temp-member]" if agg.get("temp_membership") else ""
             logger.info(
-                f"  {icon} {agg['name']} ({src_id}): "
+                f"  {icon} {agg['name']} ({src_id}){temp_tag}: "
                 f"{agg['files_migrated']} migrated | "
                 f"{agg['files_failed']} failed | "
                 f"{agg['folders_created']} folders | "
@@ -1364,7 +1592,8 @@ class SharedDriveMigrator:
             f"drives={summary['drives_migrated']}/{summary['total_drives']} | "
             f"files={summary['total_files_migrated']} migrated, "
             f"{summary['total_files_failed']} failed | "
-            f"GCS={self.stats['gcs_routed']} MEM={self.stats['memory_routed']}"
+            f"GCS={self.stats['gcs_routed']} MEM={self.stats['memory_routed']} | "
+            f"temp_memberships_used={summary['total_temp_memberships']}"
         )
 
         return summary

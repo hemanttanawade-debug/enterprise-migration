@@ -11,6 +11,8 @@ class Config:
     SCOPES = [
         'https://www.googleapis.com/auth/admin.directory.user.readonly',
         'https://www.googleapis.com/auth/admin.directory.domain.readonly',
+        'https://www.googleapis.com/auth/admin.reports.audit.readonly',
+        'https://www.googleapis.com/auth/admin.reports.usage.readonly',
         'https://www.googleapis.com/auth/drive',
         'https://www.googleapis.com/auth/drive.file',
         'https://www.googleapis.com/auth/drive.metadata',
@@ -98,7 +100,7 @@ class Config:
     GCS_BUCKET_REGION = 'asia-south1'
     GCS_STAGING_PREFIX = 'migration-staging/'      # Folder prefix inside bucket
     GCS_TEMP_EXPIRY_HOURS = 48                     # Max hours a staged file should live
-    GCS_SERVICE_ACCOUNT_FILE = 'gcs-project.json'  # ← SA key with Storage Object Admin
+    GCS_SERVICE_ACCOUNT_FILE = '/home/hemant_tanawade/amey/gcs-project.json'  # ← SA key with Storage Object Admin
 
     @classmethod
     def get_gcs_staging_path(cls, user_email: str, file_id: str) -> str:

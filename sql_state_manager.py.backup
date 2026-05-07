@@ -189,61 +189,21 @@ class SQLStateManager:
 
     def __init__(
             self,
-            db_config,                          # dict of mysql kwargs  OR  callable (legacy)
-            gcs_bucket: str = None,             # optional — not needed for discovery
-            gcs_key_file: str = None,           # optional — not needed for discovery
-            source_domain: str = "",
-            dest_domain: str = "",
+            db_config: Dict,
+            gcs_bucket: str,
+            gcs_key_file: str,
+            source_domain: str,
+            dest_domain: str,
             migration_id: str = None,
             gcs_prefix: str = DEFAULT_PREFIX,
             large_file_threshold_mb: int = LARGE_FILE_THRESHOLD,
             source_shared_drive_id: str = None,
             dest_shared_drive_id: str = None,
-            _allow_auto_id: bool = False,       # Layer 1: safety guard
             ):
-        # ── Backward-compat: discovery_engine passes Config.get_db_connection
-        #    (a callable) as the first positional arg.  Detect that pattern and
-        #    derive a proper db_config dict from Config instead. ─────────────
-        if callable(db_config):
-            try:
-                from config import Config as _Cfg
-                db_config = {
-                    "host":     _Cfg.DB_HOST,
-                    "port":     int(getattr(_Cfg, "DB_PORT", 3306)),
-                    "database": _Cfg.DB_NAME,
-                    "user":     _Cfg.DB_USER,
-                    "password": _Cfg.DB_PASSWORD,
-                }
-                if not source_domain:
-                    source_domain = getattr(_Cfg, "SOURCE_DOMAIN", "")
-                if not dest_domain:
-                    dest_domain   = getattr(_Cfg, "DEST_DOMAIN", "")
-                if gcs_bucket is None:
-                    gcs_bucket    = getattr(_Cfg, "GCS_BUCKET", None)
-                if gcs_key_file is None:
-                    gcs_key_file  = getattr(_Cfg, "GCS_KEY_FILE",
-                                            getattr(_Cfg, "SOURCE_CREDENTIALS_FILE", None))
-            except Exception as _e:
-                raise TypeError(
-                    f"SQLStateManager received a callable as db_config but could not "
-                    f"auto-resolve db connection settings from Config: {_e}"
-                ) from _e
-
-        # Layer 1: never silently generate a UUID for migration runs.
-        # for_discovery() sets _allow_auto_id=True so it can still omit migration_id.
-        # Every other caller (migration engine, resume, etc.) MUST pass migration_id=run_id.
-        if not migration_id:
-            if not _allow_auto_id:
-                raise ValueError(
-                    "SQLStateManager requires an explicit migration_id for migration runs. "
-                    "Pass migration_id=run_id so discovery and migration share the same key. "
-                    "Use SQLStateManager.for_discovery() for discovery-only instances."
-                )
-            migration_id = str(uuid.uuid4())
-        self.migration_id    = migration_id
-        self.source_domain   = source_domain or ""
-        self.dest_domain     = dest_domain   or ""
-        self.gcs_bucket_name = gcs_bucket    or ""
+        self.migration_id    = migration_id or str(uuid.uuid4())
+        self.source_domain   = source_domain
+        self.dest_domain     = dest_domain
+        self.gcs_bucket_name = gcs_bucket
         self.gcs_prefix      = gcs_prefix
         self.large_file_threshold_bytes = large_file_threshold_mb * 1024 * 1024
 
@@ -262,24 +222,18 @@ class SQLStateManager:
                     f" | src_drv={self.source_shared_drive_id}"
                     f" | dst_drv={self.dest_shared_drive_id}"
                     if self._shared_drive_mode else
-                    f" | {self.source_domain} → {self.dest_domain}"
+                    f" | {source_domain} → {dest_domain}"
                     )
                 )
 
         # ── MySQL connection pool ──────────────────────────────────────────
-        # pool_size=10: discovery runs 4 workers; 10 gives breathing room.
-        # connection_timeout=10: fail fast when pool exhausted → _conn() retry.
-        # connect_timeout=10: cap TCP handshake so network blips fail fast.
-        # pool_reset_session=False: skip reset_session() on return-to-pool;
-        #   avoids the OperationalError crash seen in the traceback when a
-        #   broken connection was returned to the pool and reset_session()
-        #   tried to talk to MySQL on an already-dead socket.
+        # NEW — pool size = (max_users × parallel_files) + headroom
+        # With 10 users × 5 files + folder threads = needs ~60; cap at MySQL's safe limit
         self._pool = pooling.MySQLConnectionPool(
-                pool_name=f"migration_pool_{uuid.uuid4().hex[:8]}",
-                pool_size=10,
-                pool_reset_session=False,
-                connection_timeout=10,
-                connect_timeout=10,
+                pool_name=f"migration_pool_{uuid.uuid4().hex[:8]}",  # unique name avoids pool name collision on re-init
+                pool_size=32,          # safe ceiling: MySQL default max_connections=151
+                pool_reset_session=True,
+                connection_timeout=30, # wait up to 30s for a free connection before raising
                 **db_config,
                 )
         logger.info(
@@ -287,90 +241,20 @@ class SQLStateManager:
                 f"/{db_config.get('database')}"
                 )
 
-        # ── GCS client (optional — skipped when bucket/key not provided) ──
-        # Discovery runs do not transfer files and never touch GCS.
-        # Migration runs always supply both gcs_bucket and gcs_key_file.
-        self._gcs    = None
-        self._bucket = None
-        if gcs_bucket and gcs_key_file:
-            try:
-                creds = service_account.Credentials.from_service_account_file(
-                        gcs_key_file,
-                        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-                        )
-                self._gcs    = gcs_storage.Client(credentials=creds, project=creds.project_id)
-                self._bucket = self._gcs.bucket(gcs_bucket)
-                logger.info(f"GCS client → bucket={gcs_bucket}")
-            except Exception as _gcs_err:
-                logger.warning(
-                    f"GCS init skipped (bucket={gcs_bucket!r}): {_gcs_err}. "
-                    f"GCS operations will fail if attempted."
+        # ── GCS client ────────────────────────────────────────────────────
+        creds = service_account.Credentials.from_service_account_file(
+                gcs_key_file,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"],
                 )
-        else:
-            logger.info(
-                "GCS client not initialised (no bucket/key_file supplied). "
-                "Safe for discovery-only runs."
-            )
+        self._gcs    = gcs_storage.Client(credentials=creds, project=creds.project_id)
+        self._bucket = self._gcs.bucket(gcs_bucket)
+        logger.info(f"GCS client → bucket={gcs_bucket}")
 
         # ── In-memory cache ───────────────────────────────────────────────
         self._cache: Dict[str, MigrationRecord] = {}
 
         # Compat alias used by old code that reads checkpoint.checkpoint_file
         self.checkpoint_file = f"sql://{db_config.get('host')}/{self.migration_id}"
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # Discovery factory — no GCS required
-    # ─────────────────────────────────────────────────────────────────────────
-
-    @classmethod
-    def for_discovery(
-            cls,
-            migration_id: str = None,
-            db_config: Dict = None,
-            source_domain: str = "",
-            dest_domain: str = "",
-            ) -> "SQLStateManager":
-        """
-        Lightweight constructor for discovery runs.
-        GCS is not initialised — discovery only reads/writes SQL.
-
-        If db_config is omitted the values are pulled from amey/config.Config
-        automatically (same behaviour as passing Config.get_db_connection).
-
-        Usage in discovery_engine.py:
-            from sql_state_manager import SQLStateManager
-            sql_mgr = SQLStateManager.for_discovery(migration_id=run_id)
-        """
-        if db_config is None:
-            try:
-                from config import Config as _Cfg
-                db_config = {
-                    "host":     _Cfg.DB_HOST,
-                    "port":     int(getattr(_Cfg, "DB_PORT", 3306)),
-                    "database": _Cfg.DB_NAME,
-                    "user":     _Cfg.DB_USER,
-                    "password": _Cfg.DB_PASSWORD,
-                }
-                source_domain = source_domain or getattr(_Cfg, "SOURCE_DOMAIN", "")
-                dest_domain   = dest_domain   or getattr(_Cfg, "DEST_DOMAIN",   "")
-            except Exception as _e:
-                raise RuntimeError(
-                    f"SQLStateManager.for_discovery() could not load db settings "
-                    f"from Config: {_e}"
-                ) from _e
-
-        # Pass no GCS args — __init__ skips GCS initialisation gracefully.
-        # _allow_auto_id=True: discovery is the ONE place allowed to omit migration_id
-        # (it generates the run_id that all later phases must reuse).
-        return cls(
-            db_config=db_config,
-            gcs_bucket=None,
-            gcs_key_file=None,
-            source_domain=source_domain,
-            dest_domain=dest_domain,
-            migration_id=migration_id,
-            _allow_auto_id=True,
-        )
 
     # ── Properties ───────────────────────────────────────────────────────────
 
@@ -385,113 +269,36 @@ class SQLStateManager:
     @contextmanager
     def _conn(self, retries: int = 6, wait: float = 0.5):
         """
-        Get a connection from the pool with retry + reconnect backoff.
-
-        KEY FIXES vs previous version
-        ──────────────────────────────
-        FIX-A  conn.close() is now in its OWN try/except, isolated from the
-               pool-retry loop.  Previously close() was inside the retry-loop's
-               try block: when close() raised
-                 OperationalError: MySQL Connection not available
-               the outer except caught it, saw it was NOT a pool-exhausted
-               error, and re-raised — crashing the entire request.
-
-        FIX-B  Before yielding, we call conn.ping(reconnect=True) so a stale
-               connection from the pool is healed before we hand it to the
-               caller rather than discovering it is dead mid-query.
-
-        FIX-C  Pool-exhausted detection broadened to also match
-               OperationalError messages about the connection not being
-               available (i.e. pool returned a dead connection it couldn't
-               reset).  Both cases are retryable.
+        Get a connection from the pool with retry backoff.
+        Handles transient 'pool exhausted' without crashing the migration.
         """
-        _RETRYABLE = (
-            "pool exhausted",
-            "connection not available",      # FIX-C
-            "mysql connection not available", # FIX-C
-        )
-
         last_exc = None
         for attempt in range(retries):
-            conn = None
             try:
                 conn = self._pool.get_connection()
-
-                # FIX-B: heal stale / timed-out connections before use
-                try:
-                    conn.ping(reconnect=True, attempts=3, delay=1)
-                except Exception as ping_exc:
-                    logger.warning(
-                        f"SQL ping failed (attempt {attempt+1}/{retries}): {ping_exc} "
-                        f"— will retry"
-                    )
-                    # FIX-A: close in its own try so it never propagates
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    conn = None
-                    raise ping_exc   # falls into outer except → retry logic below
-
                 try:
                     yield conn
                     conn.commit()
                 except Exception:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
+                    conn.rollback()
                     raise
                 finally:
-                    # FIX-A: close() is isolated — its exceptions NEVER reach
-                    # the retry loop or the caller.
-                    if conn is not None:
-                        try:
-                            conn.close()
-                        except Exception as close_exc:
-                            logger.debug(
-                                f"SQL conn.close() swallowed (connection was "
-                                f"already broken): {close_exc}"
-                            )
-                return   # success — exit retry loop
-
+                    conn.close()
+                return
             except Exception as exc:
                 last_exc = exc
-                exc_str  = str(exc).lower()
-                is_retryable = any(tok in exc_str for tok in _RETRYABLE) or \
-                               "PoolError" in type(exc).__name__
-
-                if is_retryable and attempt < retries - 1:
-                    sleep_time = wait * (2 ** attempt)   # 0.5, 1, 2, 4, 8, 16 s
+                if "pool exhausted" in str(exc).lower() or "PoolError" in type(exc).__name__:
+                    sleep_time = wait * (2 ** attempt)   # 0.5, 1, 2, 4, 8, 16s
                     logger.warning(
-                        f"SQL retryable error (attempt {attempt+1}/{retries}) "
-                        f"— retrying in {sleep_time:.1f}s | {exc}"
-                    )
+                            f"SQL pool exhausted (attempt {attempt+1}/{retries}) "
+                            f"— retrying in {sleep_time:.1f}s"
+                            )
                     time.sleep(sleep_time)
                 else:
-                    raise   # non-retryable or final attempt — fail fast
-
+                    raise   # non-pool errors fail immediately
         raise last_exc
 
     def _execute(self, sql: str, params=(), many: bool = False) -> List[Dict]:
-        """
-        Execute sql with params.
-
-        When many=True (executemany), large param lists are chunked into
-        batches of 50 rows.  Each batch gets its own connection-pool checkout
-        so no single thread holds a connection while 500+ rows are being
-        inserted — which was starving concurrent worker threads.
-        """
-        if many and isinstance(params, (list, tuple)) and len(params) > 50:
-            CHUNK = 50
-            for i in range(0, len(params), CHUNK):
-                chunk = params[i : i + CHUNK]
-                with self._conn() as conn:
-                    cur = conn.cursor(dictionary=True)
-                    cur.executemany(sql, chunk)
-                time.sleep(0.05)   # brief yield between chunks
-            return []
-
         with self._conn() as conn:
             cur = conn.cursor(dictionary=True)
             if many:
@@ -1008,31 +815,6 @@ class SQLStateManager:
                 f"for migration_id={self.migration_id}"
                 )
         return records
-
-    # Layer 2: fail-fast helpers used by run_migration() before starting Phase 1
-    def count_pending_items(self) -> int:
-        """
-        Return count of PENDING/FAILED file rows for this migration_id.
-        Returns 0 if discovery never ran or all files are already DONE.
-        Called by run_migration() as a pre-flight check.
-        """
-        row = self._one(
-            "SELECT COUNT(*) AS n FROM migration_items "
-            "WHERE migration_id=%s AND status IN ('PENDING','FAILED') AND is_folder=0",
-            (self.migration_id,),
-        )
-        return int(row["n"]) if row else 0
-
-    def migration_run_exists(self) -> bool:
-        """
-        Return True if a migration_runs row exists for this migration_id.
-        Used to distinguish 'discovery never ran' from 'all files already done'.
-        """
-        row = self._one(
-            "SELECT 1 AS found FROM migration_runs WHERE migration_id=%s",
-            (self.migration_id,),
-        )
-        return row is not None
 # ─────────────────────────────────────────────────────────────────────────
     # migration_items  —  status transitions
     # ─────────────────────────────────────────────────────────────────────────
@@ -1503,22 +1285,12 @@ class SQLStateManager:
             chunk_size_bytes: int = 20 * 1024 * 1024,
             ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
-        Download a file from Drive chunk-by-chunk and pipe each chunk directly
-        into a GCS resumable upload stream.
-
-        RAM usage: one chunk (~20 MB) at a time regardless of file size.
-
-        HOW IT WORKS:
-          MediaIoBaseDownload writes each chunk into a small io.BytesIO buffer.
-          After each chunk we immediately write that buffer into blob.open("wb")
-          — a GCS resumable upload stream — then truncate the buffer to zero.
-          The Drive API delivers data in chunk_size_bytes increments so only
-          one chunk is ever in RAM at once.
-
-        Returns (ok, blob_name, error_message).
+        Download a file from Drive (or export a Workspace file) and stream
+        directly to GCS.  Returns (ok, blob_name, error_message).
         """
         suffix = ""
         if export_mime:
+            # Determine extension from MIME
             for ws_mime, (exp_mime, ext, _) in GOOGLE_WORKSPACE_EXPORT.items():
                 if exp_mime == export_mime:
                     suffix = ext
@@ -1526,50 +1298,38 @@ class SQLStateManager:
 
         blob_name = self._blob_name(run_id, file_id, suffix)
 
-        if self._bucket is None:
-            return False, None, "GCS not initialised (discovery-only SQLStateManager)"
-
         try:
             if export_mime:
                 request = drive_svc.files().export_media(
-                        fileId=file_id, mimeType=export_mime)
+                        fileId=file_id, mimeType=export_mime
+                        )
             else:
                 request = drive_svc.files().get_media(
-                        fileId=file_id, supportsAllDrives=True)
+                        fileId=file_id, supportsAllDrives=True
+                        )
 
-            blob         = self._bucket.blob(blob_name)
-            content_type = export_mime or mime_type or "application/octet-stream"
-            dl_start     = time.time()
+            buf      = io.BytesIO()
+            dl       = MediaIoBaseDownload(buf, request, chunksize=chunk_size_bytes)
+            done     = False
+            dl_start = time.time()
 
-            # blob.open("wb") opens a GCS resumable upload session.
-            # We write each Drive chunk into it immediately and clear the buffer,
-            # so peak RAM = one chunk (~20 MB) regardless of file size.
-            with blob.open("wb", content_type=content_type) as gcs_stream:
-                chunk_buf = io.BytesIO()
-                dl        = MediaIoBaseDownload(chunk_buf, request,
-                                                chunksize=chunk_size_bytes)
-                done = False
-                while not done:
-                    if time.time() - dl_start > 1800:
-                        raise TimeoutError("Drive download timeout (30 min)")
-                    _, done = dl.next_chunk()
-                    # Flush this chunk to GCS then clear the buffer for the next
-                    chunk_buf.seek(0)
-                    gcs_stream.write(chunk_buf.read())
-                    chunk_buf.seek(0)
-                    chunk_buf.truncate(0)
+            while not done:
+                if time.time() - dl_start > 1800:
+                    return False, None, "Download timeout (30 min)"
+                _, done = dl.next_chunk()
 
+            buf.seek(0)
+            blob = self._bucket.blob(blob_name)
+            blob.upload_from_file(
+                    buf,
+                    content_type=export_mime or mime_type or "application/octet-stream",
+                    )
             logger.debug(f"GCS ↑ {blob_name}")
             return True, blob_name, None
 
         except Exception as exc:
             err = str(exc)
             logger.warning(f"download_drive_to_gcs failed [{file_name}]: {err}")
-            # Clean up any partial blob so retries start fresh
-            try:
-                self._bucket.blob(blob_name).delete()
-            except Exception:
-                pass
             return False, None, err
 
     def upload_gcs_to_drive(
@@ -1583,38 +1343,12 @@ class SQLStateManager:
             chunk_size_bytes: int = 20 * 1024 * 1024,
             ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
-        Stream a GCS blob to destination Drive using a manual resumable upload.
-
-        RAM usage: one chunk (~20 MB) at a time regardless of file size.
-
-        WHY NOT blob.open("rb") + MediaIoBaseUpload:
-          MediaIoBaseUpload internally calls seek() on its source for chunk
-          retries. GCS blob.open("rb") does NOT support seek(), which causes
-          the Drive client library to issue a redirect-based retry that has
-          no Location header — giving:
-            "Redirected but the response is missing a Location: header"
-
-        HOW IT WORKS:
-          We use google.auth.transport.requests.AuthorizedSession to make raw
-          HTTP calls with the same OAuth credentials as drive_svc, bypassing
-          the Drive client library's redirect handling entirely:
-            1. POST  → initiate resumable upload session, get session_uri
-            2. Loop  → PUT each 20 MB chunk with Content-Range header
-               308   → chunk accepted, continue
-               200/201 → upload complete, extract file id
-
+        Download blob from GCS and upload to destination Drive.
         Returns (ok, dest_file_id, error_message).
         """
-        if self._bucket is None:
-            return False, None, "GCS not initialised (discovery-only SQLStateManager)"
-
         try:
-            import json as _json
-            from google.auth.transport.requests import AuthorizedSession
-
             blob = self._bucket.blob(blob_name)
-            blob.reload()                          # fetch metadata to get blob size
-            total_size = blob.size or 0
+            data = blob.download_as_bytes()
 
             meta = {"name": file_name}
             if parent_id:
@@ -1622,97 +1356,17 @@ class SQLStateManager:
             if import_mime:
                 meta["mimeType"] = import_mime
 
-            # Extract the google.auth credentials from the Drive service's
-            # underlying httplib2-authorized http object so we can build an
-            # AuthorizedSession that handles OAuth token refresh correctly.
-            try:
-                credentials = drive_svc._http.credentials
-            except AttributeError:
-                # Fallback for newer google-api-python-client versions
-                credentials = drive_svc._http.http.credentials
-
-            session = AuthorizedSession(credentials)
-
-            # ── Step 1: initiate the resumable upload session ─────────────────
-            init_url = (
-                "https://www.googleapis.com/upload/drive/v3/files"
-                "?uploadType=resumable&supportsAllDrives=true&fields=id"
-            )
-            init_resp = session.post(
-                init_url,
-                headers={
-                    "Content-Type":            "application/json; charset=UTF-8",
-                    "X-Upload-Content-Type":   mime_type,
-                    "X-Upload-Content-Length": str(total_size),
-                },
-                data=_json.dumps(meta).encode("utf-8"),
-                allow_redirects=False,   # we need the Location header, not the redirect target
-            )
-
-            if init_resp.status_code not in (200, 201):
-                raise RuntimeError(
-                    f"Resumable upload initiation failed: "
-                    f"HTTP {init_resp.status_code} — {init_resp.text[:300]}"
-                )
-
-            session_uri = init_resp.headers.get("Location")
-            if not session_uri:
-                raise RuntimeError(
-                    f"Resumable upload: no Location header. "
-                    f"Response headers: {dict(init_resp.headers)}"
-                )
-
-            # ── Step 2: stream blob chunks to Drive ───────────────────────────
-            dest_file_id = None
-            offset       = 0
-
-            with blob.open("rb") as gcs_stream:
-                while offset < total_size:
-                    chunk = gcs_stream.read(chunk_size_bytes)
-                    if not chunk:
-                        break
-
-                    end       = offset + len(chunk) - 1
-                    total_str = str(total_size) if total_size > 0 else "*"
-
-                    chunk_resp = session.put(
-                        session_uri,
-                        headers={
-                            "Content-Range": f"bytes {offset}-{end}/{total_str}",
-                            "Content-Type":  mime_type,
-                        },
-                        data=chunk,
-                        allow_redirects=False,
+            media = MediaIoBaseUpload(
+                    io.BytesIO(data),
+                    mimetype=mime_type,
+                    resumable=True,
+                    chunksize=chunk_size_bytes,
                     )
-                    code = chunk_resp.status_code
-
-                    if code in (200, 201):
-                        # Upload complete
-                        body = chunk_resp.json() if chunk_resp.content else {}
-                        dest_file_id = body.get("id")
-                        break
-                    elif code == 308:
-                        # Chunk accepted — Drive tells us the confirmed range
-                        confirmed = chunk_resp.headers.get("Range", "")
-                        if confirmed:
-                            # "bytes=0-20971519" → next offset = end+1
-                            offset = int(confirmed.split("-")[-1]) + 1
-                        else:
-                            offset = end + 1
-                        continue
-                    else:
-                        raise RuntimeError(
-                            f"Chunk PUT failed at offset {offset}: "
-                            f"HTTP {code} — {chunk_resp.text[:300]}"
-                        )
-
-            if not dest_file_id:
-                raise RuntimeError(
-                    f"Upload loop ended without a file id "
-                    f"(offset={offset}, total={total_size})"
-                )
-
-            return True, dest_file_id, None
+            f = drive_svc.files().create(
+                    body=meta, media_body=media,
+                    fields="id", supportsAllDrives=True,
+                    ).execute()
+            return True, f["id"], None
 
         except Exception as exc:
             err = str(exc)
@@ -1721,9 +1375,6 @@ class SQLStateManager:
 
     def delete_temp(self, blob_name: str):
         """Delete one staging blob after confirmed migration."""
-        if self._bucket is None:
-            logger.debug("delete_temp: GCS not initialised — skipping")
-            return
         try:
             self._bucket.blob(blob_name).delete()
             logger.debug(f"GCS ✗ {blob_name}")
@@ -1732,9 +1383,6 @@ class SQLStateManager:
 
     def cleanup_run_temps(self, run_id):
         """Remove all staging blobs for a completed run."""
-        if self._bucket is None:
-            logger.debug("cleanup_run_temps: GCS not initialised — skipping")
-            return
         prefix = f"{self.gcs_prefix}{run_id}/"
         blobs  = list(self._bucket.list_blobs(prefix=prefix))
         if blobs:
