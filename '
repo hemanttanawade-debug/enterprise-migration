@@ -17,15 +17,14 @@ class Config:
         'https://www.googleapis.com/auth/drive',
         'https://www.googleapis.com/auth/drive.file',
         'https://www.googleapis.com/auth/drive.metadata',
-        'https://www.googleapis.com/auth/drive.readonly',
-        "https://www.googleapis.com/auth/drive.metadata.readonly"
+        'https://www.googleapis.com/auth/drive.readonly'
     ]
     
     # ============================================================================
     # SOURCE DOMAIN CONFIGURATION
     # ============================================================================
-    SOURCE_DOMAIN = 'pilot.shivaami.in'
-    SOURCE_ADMIN_EMAIL = 'developer@pilot.shivaami.in'
+    SOURCE_DOMAIN = 'dev.shivaami.in'
+    SOURCE_ADMIN_EMAIL = 'hemant@dev.shivaami.in'
     SOURCE_CREDENTIALS_FILE = 'source_credentials.json'
     
     # ============================================================================

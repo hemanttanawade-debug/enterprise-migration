@@ -1,59 +1,113 @@
 """
-shared_drive_migrator.py  (v4 – Temporary Admin Membership)
+shared_drive_migrator.py  (v13 – GCS upload rate limiter + executor shutdown guard)
 
-PATCH CHANGES vs v3:
-  1. TWO-PHASE ARCHITECTURE (mirrors migration_engine.py v3):
-       Phase 1 — Discovery: list files, build folder structure, register items in SQL.
-                 Runs per-drive in parallel (DISCOVERY_WORKERS drives at once).
-       Phase 2 — Global Queue: flat ThreadPoolExecutor drains ALL pending files
-                 from SQL across all drives simultaneously (GLOBAL_WORKERS).
+CRITICAL BUG FIXES vs v9:
 
-  2. GCS / MEMORY ROUTING (mirrors migration_engine.py):
-       _migrate_one_file_v3() replaces the old _migrate_one_file():
-         - file_size < 50 MB  → _migrate_via_memory()   (BytesIO, direct upload)
-         - file_size >= 50 MB → _migrate_via_gcs()       (stream through GCS bucket)
+  BUG-FIX-1  _verify_or_create_dest_drive_by_id() was creating a NEW Shared Drive
+             named after the SOURCE drive (e.g. 'z') whenever drives().get() returned
+             a 404 or 403.  Root causes:
+               a) drives().get() was called WITHOUT useDomainAdminAccess=True, so the
+                  dest service account got a false 404 even when the drive existed.
+               b) On any access error the code fell through to create_dest_shared_drive(),
+                  which created a brand-new drive instead of writing into the pre-mapped
+                  destination ('hemant', 0AIlOaJWf3SCuUk9PVA).
+             Fix: _verify_or_create_dest_drive_by_id() now:
+               - Retries with useDomainAdminAccess=True first, then without.
+               - NEVER creates a new drive — it only verifies the given ID and returns
+                 None (which causes the drive pair to be skipped with a clear error log).
 
-  3. TEMPORARY ADMIN MEMBERSHIP (NEW in v4):
-       Problem: Source domain admin may not be a member of every Shared Drive,
-                causing 404/403 errors when listing files or accessing the drive.
-       Solution:
-         _ensure_admin_access(drive_id, drive_name):
-           - Checks whether the admin service account IS already a member of the
-             source Shared Drive.
-           - If YES → records was_temporary=False, does nothing.
-           - If NO  → adds admin as 'organizer' (temporary), records
-                      was_temporary=True, so it can be cleaned up later.
-         _revoke_admin_access(drive_id, drive_name, permission_id):
-           - Removes the temporary permission added above.
-           - Called in a `finally` block inside migrate_all_shared_drives() so
-             cleanup always runs, even if the drive migration throws.
-         IMPORTANT: Only the drive-level temporary membership is added/removed.
-                    File-level permissions are NEVER modified — existing file
-                    shares are not touched, and the admin is not granted access
-                    to individual files that were not already shared with it.
+  BUG-FIX-2  _migrate_item_permissions() used self.source_drive (shared across all
+             threads) for permissions().list().  httplib2 is NOT thread-safe, causing:
+               - 240–950 second FILE.migrate_perms stalls (httplib2 connection corruption
+                 → retry loops inside the HTTP layer)
+               - 'NoneType' object has no attribute 'close' crashes (corrupted response)
+             Fix: _migrate_item_permissions() now accepts optional src_drive/dst_drive
+             parameters.  _process_queue_item() passes thread_src_drive/thread_dst_drive
+             (per-thread cached services) into every call.
 
-  4. PERMISSION LOGIC UNCHANGED:
-       _migrate_item_permissions() — not touched.
-       migrate_drive_members()     — not touched.
+NEW in v12 – Discovery-First permission optimisation (PERF-8):
 
-  5. FOLDER BUILDING UNCHANGED:
-       _build_shared_drive_folder_structure() — not touched.
-       _create_folder_in_shared_drive()       — not touched.
-       _sort_folders_by_hierarchy()           — not touched.
+  PERF-8  _migrate_item_permissions() was called unconditionally on every folder
+          and file, issuing one permissions().list() Drive API call per item even
+          when that item's ACL was purely inherited from the Shared Drive root.
+          For a 1 000-file drive this generated ~1 000 redundant API calls that
+          saturated the quota (429 rate-limit errors) and wasted wall-clock time.
 
-  6. SQL INTERFACE UNCHANGED:
-       All mgr.* calls identical to v3 — no new methods required from
-       sql_state_manager.py or main.py.
+          Fix — Discovery-First approach:
+            a) list_shared_drive_files() now requests two extra metadata fields:
+                 hasExplicitRoles  – True only when the item carries at least one
+                                     ACL entry beyond Shared Drive inheritance.
+                 capabilities.canShare – guard to verify we have share rights
+               These come for FREE in the existing files.list() response; no
+               extra API round-trip is needed.
 
-CONSTRUCTOR SIGNATURE: unchanged from v3.
-    SharedDriveMigrator(source_admin_drive, dest_admin_drive,
-                        source_domain, dest_domain, config,
-                        sql_mgr, run_id, parallel_files)
+            b) _build_shared_drive_folder_structure() checks hasExplicitRoles
+               on each folder dict before calling _migrate_item_permissions().
+               If False, the item inherits from the drive root → skip the call.
+
+            c) _process_queue_item() checks item.has_explicit_roles (persisted
+               to SQL by the state manager during register_discovered_items).
+               If False → skip _migrate_item_permissions() entirely.
+
+            d) _migrate_item_permissions() accepts an optional has_explicit_roles
+               kwarg as a fast-path override so callers that already know the
+               answer don't repeat the check inside.
+
+          Result: permissions().list() is called ONLY for the small minority of
+          items that truly carry explicit overrides — drive members are already
+          migrated via migrate_drive_members() and destination inheritance
+          propagates those roles automatically.
+
+NEW in v13 – GCS upload rate limiter + executor shutdown guard:
+
+  FIX-GCS-1  upload_gcs_to_drive was fired by 14 workers simultaneously with
+             zero rate control, exhausting the per-user Drive API quota for
+             files.create (resumable upload initiation) immediately, producing
+             a cascade of:
+               HTTP 403 "User rate limit exceeded" / userRateLimitExceeded
+             on every upload attempt and triggering PM2 SIGKILL (process stuck
+             in retry sleeps → PM2 loses patience after 1600 ms → SIGKILL).
+
+             Fix: module-level _GCS_UPLOAD_BUCKET (_UploadTokenBucket) shared
+             across all 14 worker threads.  consume() is called once per GCS
+             upload attempt, before sub_pool.submit(upload_gcs_to_drive).
+             Rate defaults to 6 initiations/sec (safe below the 10 QPS default
+             Drive quota, leaving headroom for concurrent memory-path uploads).
+             Tune _GCS_UPLOAD_RATE if you obtain a quota increase.
+
+  FIX-GCS-2  403 userRateLimitExceeded in upload error string is now treated
+             identically to a 429: the retry wait is doubled to drain the quota
+             window before the next attempt, instead of retrying immediately.
+
+  FIX-GCS-3  "cannot schedule new futures after interpreter shutdown" crash:
+             _migrate_via_gcs() creates nested ThreadPoolExecutor sub-pools
+             (one for download, one for upload). When PM2 sends SIGTERM/SIGKILL
+             mid-flight the outer pool's __exit__ begins tearing down threads
+             while a worker is still inside _migrate_via_gcs() trying to
+             sub_pool.submit() — Python raises RuntimeError: "cannot schedule
+             new futures after interpreter shutdown".
+
+             Fix: both sub_pool blocks are now wrapped in try/except RuntimeError.
+             On shutdown the method returns a clean {"error_type": "executor_shutdown"}
+             result so the outer pool can drain gracefully without an unhandled
+             exception propagating to the PM2 log.
+
+UNCHANGED from v12:
+  - BUG-FIX-1 (verify-only dest drive, no spurious creation).
+  - BUG-FIX-2 (per-thread src/dst Drive services, no shared httplib2).
+  - Temporary source admin organizer + revoke after migration.
+  - Temporary destination admin organizer + revoke after migration.
+  - All PERF-1 through PERF-8 throughput improvements.
+  - FIX-1/FIX-2/FIX-3 from permissions_migrator (organizer→fileOrganizer, NoneType guard).
+  - RAM-adaptive chunk sizes (8–256 MB).
+  - XL-first two-pass queue, IN_PROGRESS reset, thread-local Drive services.
 """
 
+import concurrent.futures as _cf
 import io
 import logging
 import random
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -65,17 +119,177 @@ from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tunable constants  (mirrors migration_engine.py values)
+# Tunable constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-LARGE_FILE_THRESHOLD_BYTES = 50 * 1_024 * 1_024   # 50 MB → GCS path
-GLOBAL_WORKERS    = 14    # I/O-bound workers for Phase 2 file queue
-DISCOVERY_WORKERS = 4     # parallel drives during Phase 1 discovery
+LARGE_FILE_THRESHOLD_BYTES  = 5   * 1_024 * 1_024        # 5 MB   → GCS path
+XLARGE_FILE_THRESHOLD_BYTES = 600 * 1_024 * 1_024        # 600 MB → XL dedicated pool
+MAX_FILE_SIZE_BYTES         = 5   * 1_024 * 1_024 * 1_024  # 5 GB   → hard ignore limit
+
+# ── Phase-2 file transfer workers (PERF-1: raised to match migration_engine_v4) ──
+GLOBAL_WORKERS    = 14   # Phase-2 regular pool      (was 10 in v6)
+XLARGE_WORKERS    = 14   # Phase-2 XL dedicated pool (was  6 in v6)
+
+# ── Phase-1 discovery ────────────────────────────────────────────────────────
+DISCOVERY_WORKERS = 8    # parallel drives during Phase 1
+
+# ── Pre-flight and post-migration parallelism (PERF-4/5/6: new) ──────────────
+PREFLIGHT_WORKERS = 8    # parallel _ensure_admin_access() calls  (was serial)
+MEMBER_WORKERS    = 8    # parallel migrate_drive_members() calls (was serial)
+CLEANUP_WORKERS   = 8    # parallel dest-organizer + revoke calls (was serial)
+
 MAX_RETRIES       = 5
 MAX_BACKOFF_S     = 32
-CHUNK_SIZE        = 32 * 1_024 * 1_024   # 32 MB per chunk
+CHUNK_SIZE        = 32 * 1_024 * 1_024   # default; overridden by RAM probe
+GCS_FILE_TIMEOUT  = 3_600                # seconds — hard per-file GCS timeout
 
-from sql_state_manager import IGNORED_MIME_TYPES, GOOGLE_WORKSPACE_EXPORT
+# ── Drive API listing page sizes (PERF-2: files page raised 200→1000) ────────
+FILES_LIST_PAGE_SIZE  = 1000   # was 200 — 5× fewer round-trips per drive
+DRIVES_LIST_PAGE_SIZE = 100    # unchanged — API max for drives.list
+
+try:
+    import psutil as _psutil
+    _PSUTIL_AVAILABLE = True
+except ImportError:
+    _psutil = None
+    _PSUTIL_AVAILABLE = False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-GCS-1: GCS upload rate limiter
+#
+# Drive API quota for files.create (resumable upload initiation) is per-user
+# and shared across all 14 worker threads.  Without throttling, 14 threads
+# firing simultaneously exhaust the quota window in under 1 s, producing
+# HTTP 403 "userRateLimitExceeded" on every upload and stalling the process
+# long enough that PM2 sends SIGKILL.
+#
+# _GCS_UPLOAD_RATE  — resumable upload initiations per second, project-wide.
+#                     Default Drive quota: ~10 QPS for files.create.
+#                     We use 6 to leave headroom for memory-path uploads that
+#                     also call files.create concurrently.
+#                     Raise this if you have a quota increase approved in GCP.
+# ─────────────────────────────────────────────────────────────────────────────
+_GCS_UPLOAD_RATE  = 6    # upload initiations / second  ← tune after quota increase
+_GCS_UPLOAD_BURST = 6    # max burst tokens (== rate → no burst spike allowed)
+
+
+class _UploadTokenBucket:
+    """
+    Thread-safe token bucket for rate-limiting GCS→Drive upload initiations.
+
+    One module-level instance (_GCS_UPLOAD_BUCKET) is shared across all worker
+    threads.  consume() blocks only when the bucket is empty — callers that
+    arrive when tokens are available pay zero wait time.
+    """
+
+    def __init__(self, rate: float = 6.0, burst: int = 6):
+        self._rate   = float(rate)
+        self._burst  = float(burst)
+        self._tokens = float(burst)   # start full → first calls are free
+        self._last   = time.monotonic()
+        self._lock   = threading.Lock()
+
+    def consume(self, n: int = 1) -> None:
+        """Block until n tokens are available, then consume them."""
+        with self._lock:
+            now          = time.monotonic()
+            elapsed      = now - self._last
+            self._tokens = min(self._burst,
+                               self._tokens + elapsed * self._rate)
+            self._last   = now
+            if self._tokens >= n:
+                self._tokens -= n
+                wait = 0.0
+            else:
+                wait = (n - self._tokens) / self._rate
+                self._tokens = 0.0
+        if wait > 0:
+            time.sleep(wait)
+
+
+# Module-level singleton — ONE bucket shared by ALL 14 upload worker threads.
+_GCS_UPLOAD_BUCKET = _UploadTokenBucket(
+    rate=_GCS_UPLOAD_RATE,
+    burst=_GCS_UPLOAD_BURST,
+)
+
+# Import from sql_state_manager — GOOGLE_WORKSPACE_EXPORT kept for backwards
+# compat in other modules; GOOGLE_WORKSPACE_TYPES defined locally below.
+from sql_state_manager import IGNORED_MIME_TYPES as _BASE_IGNORED, GOOGLE_WORKSPACE_EXPORT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-1: Augmented IGNORED_MIME_TYPES — adds legacy Google Video type.
+# The Drive API rejects get_media() for 'vid' with "Use Export" but it also
+# has no supported export MIME type, so it must be ignored entirely.
+# ─────────────────────────────────────────────────────────────────────────────
+IGNORED_MIME_TYPES = frozenset(_BASE_IGNORED) | frozenset({
+    "application/vnd.google-apps.vid",
+    "application/vnd.google-apps.script",
+    "application/vnd.google-apps.form",
+    "application/vnd.google-apps.site",
+    "application/octet-stream",# FIX-1: legacy Google Video — no export API
+})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-3 / FIX-2: GOOGLE_WORKSPACE_TYPES dict (mirrors migration_engine_v4).
+#
+# Using this instead of the simpler GOOGLE_WORKSPACE_EXPORT tuple gives us:
+#   - can_export=False  → immediate ignore for shortcuts, forms, etc.
+#   - fallback_mime     → PDF retry when exportSizeLimitExceeded for large Slides
+#   - Consistent with migration_engine_v4's workspace handling logic
+# ─────────────────────────────────────────────────────────────────────────────
+GOOGLE_WORKSPACE_TYPES = {
+    "application/vnd.google-apps.document": {
+        "export_mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "extension":   ".docx",
+        "import_mime": "application/vnd.google-apps.document",
+        "can_export":  True,
+    },
+    "application/vnd.google-apps.spreadsheet": {
+        "export_mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "extension":   ".xlsx",
+        "import_mime": "application/vnd.google-apps.spreadsheet",
+        "can_export":  True,
+    },
+    # FIX-2: fallback_mime + fallback_ext for oversized presentations
+    "application/vnd.google-apps.presentation": {
+        "export_mime":   "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "extension":     ".pptx",
+        "import_mime":   "application/vnd.google-apps.presentation",
+        "can_export":    True,
+        "fallback_mime": "application/pdf",
+        "fallback_ext":  ".pdf",
+    },
+    "application/vnd.google-apps.drawing": {
+        "export_mime":   "image/svg+xml",
+        "extension":     ".svg",
+        "import_mime":   None,
+        "can_export":    True,
+        "fallback_mime": "application/pdf",
+        "fallback_ext":  ".pdf",
+    },
+    "application/vnd.google-apps.map": {
+        "export_mime": "application/vnd.google-earth.kmz",
+        "extension":   ".kmz",
+        "import_mime": None,
+        "can_export":  True,
+    },
+    "application/vnd.google-apps.jam": {
+        "export_mime": "application/pdf",
+        "extension":   ".pdf",
+        "import_mime": None,
+        "can_export":  True,
+    },
+    "application/vnd.google-apps.folder": {
+        "export_mime": None, "extension": None, "import_mime": None, "can_export": False,
+    },
+    # FIX-3: shortcuts have no content — non-exportable so they're ignored cleanly
+    "application/vnd.google-apps.shortcut": {
+        "export_mime": None, "extension": None, "import_mime": None, "can_export": False,
+    },
+}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +310,53 @@ def _fmt_bytes(b: int) -> str:
     return f"{b:.2f} PB"
 
 
+def _extract_id(response) -> Optional[str]:
+    """Safely pull 'id' from a Drive API response (dict or list)."""
+    if isinstance(response, list):
+        response = response[0] if response else None
+    if isinstance(response, dict):
+        return response.get("id")
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX-1: RAM-adaptive chunk size — properly scaled (was returning 16 MB for
+# every tier in v5/v6 due to a copy-paste error; now matches the documented
+# table in migration_engine_v4).
+#
+# Available RAM  →  Chunk size
+# ──────────────────────────────
+# <  512 MB      →   8 MB   (safe floor)
+# <  1   GB      →  16 MB
+# <  2   GB      →  32 MB   (matches previous static default)
+# <  4   GB      →  64 MB
+# <  8   GB      → 128 MB
+# >= 8   GB      → 256 MB   (saturates most GCP connections)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_adaptive_chunk_size() -> int:
+    """
+    Return a download/upload chunk size scaled to available system RAM.
+    Falls back to CHUNK_SIZE when psutil is unavailable.
+    """
+    if not _PSUTIL_AVAILABLE:
+        return CHUNK_SIZE
+    try:
+        avail_mb = _psutil.virtual_memory().available / (1024 * 1024)
+        if   avail_mb <  512: chunk_mb =  8    # FIX: was hardcoded 16 for all tiers
+        elif avail_mb < 1024: chunk_mb = 16
+        elif avail_mb < 2048: chunk_mb = 32
+        elif avail_mb < 4096: chunk_mb = 64
+        elif avail_mb < 8192: chunk_mb = 128
+        else:                 chunk_mb = 256
+        logger.debug(
+            f"[RAM-ADAPT] available={avail_mb:.0f} MB → chunk_size={chunk_mb} MB"
+        )
+        return chunk_mb * 1024 * 1024
+    except Exception:
+        return CHUNK_SIZE
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SharedDriveMigrator
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,35 +365,16 @@ class SharedDriveMigrator:
     """
     Handles Shared Drive → Shared Drive migration.
 
-    Two-phase architecture (v3+):
+    Two-phase architecture:
       Phase 1 — per-drive discovery + folder creation (parallel drives).
-      Phase 2 — global file queue drained by a flat thread pool.
+      Phase 2 — XL-first two-pass global queue, sorted largest-first.
 
-    v4 addition — Temporary Admin Membership:
-      Before Phase 1 for each drive, _ensure_admin_access() checks whether the
-      source admin service account is already a member of the source Shared Drive.
-      If not, it is added temporarily as 'organizer' so that all Drive API calls
-      (list, get_media, permissions.list, etc.) succeed.  After migration of that
-      drive completes (success or failure), _revoke_admin_access() removes the
-      temporary permission.  File-level permissions are never touched.
-
-    Key differences from My Drive:
-      - Ownership lives at drive level, not per-file
-      - All API calls need supportsAllDrives=True
-      - Members are drive-level permissions
-      - File permissions are additive overrides on top of drive membership
-
-    Constructor
-    ───────────
-    source_admin_drive  : Drive service authenticated as source domain admin
-    dest_admin_drive    : Drive service authenticated as dest domain admin
-    source_domain       : str  e.g. 'dev.shivaami.in'
-    dest_domain         : str  e.g. 'demo.shivaami.in'
-    config              : Config object  (must expose config.source_admin_email)
-    sql_mgr             : SQLStateManager instance (checkpoint + GCS helper)
-    run_id              : int / str — current migration_runs.migration_id
-    parallel_files      : int — ignored in v3+ (GLOBAL_WORKERS used instead),
-                          kept for constructor compatibility
+    v7: Full performance parity with migration_engine_v4.
+        RAM-adaptive chunk sizes actually scale (8–256 MB).
+        5 GB hard-ignore limit added.
+        GOOGLE_WORKSPACE_TYPES with fallback PDF export for oversized Slides.
+        pending list sorted largest-first before XL/regular split.
+        cache_discovery=False on all Drive service builds.
     """
 
     def __init__(
@@ -144,7 +386,7 @@ class SharedDriveMigrator:
         config,
         sql_mgr,
         run_id,
-        parallel_files: int = 5,   # compat — superseded by GLOBAL_WORKERS
+        parallel_files: int = 5,
     ):
         self.source_drive   = source_admin_drive
         self.dest_drive     = dest_admin_drive
@@ -153,37 +395,90 @@ class SharedDriveMigrator:
         self.config         = config
         self.mgr            = sql_mgr
         self.run_id         = run_id
-        self.parallel_files = parallel_files   # kept for compat
+        self.parallel_files = parallel_files
 
-        # Resolve the admin email used for temporary membership checks.
-        # Tries config.source_admin_email first, falls back to
-        # config.admin_email, then None (graceful degradation).
+        # FIX: try uppercase attrs first (real Config class uses SOURCE_ADMIN_EMAIL)
         self._admin_email: Optional[str] = (
-            getattr(config, "source_admin_email", None)
+            getattr(config, "SOURCE_ADMIN_EMAIL", None)
+            or getattr(config, "source_admin_email", None)
             or getattr(config, "admin_email", None)
         )
 
+        # Store credential paths so each worker thread can build its OWN
+        # Drive service — httplib2 is NOT thread-safe; sharing one service
+        # across threads causes concurrent next_chunk() to corrupt the connection.
+        from pathlib import Path as _Path
+        _FLASK_CRED_DIR = _Path.home() / "flask-backend" / "uploads" / "credential"
+        self._src_creds_file: Optional[str] = None
+        self._dst_creds_file: Optional[str] = None
+        self._src_admin_email: Optional[str] = self._admin_email
+        self._dst_admin_email: Optional[str] = (
+            getattr(config, "DEST_ADMIN_EMAIL", None)
+            or getattr(config, "dest_admin_email", None)
+        )
+        try:
+            src_p = _FLASK_CRED_DIR / "source_credentials.json"
+            dst_p = _FLASK_CRED_DIR / "dest_credentials.json"
+            if src_p.exists():
+                self._src_creds_file = str(src_p)
+            elif hasattr(config, "SOURCE_CREDENTIALS_FILE"):
+                self._src_creds_file = str(config.SOURCE_CREDENTIALS_FILE)
+            if dst_p.exists():
+                self._dst_creds_file = str(dst_p)
+            elif hasattr(config, "DEST_CREDENTIALS_FILE"):
+                self._dst_creds_file = str(config.DEST_CREDENTIALS_FILE)
+        except Exception as _ce:
+            logger.warning(f"[INIT] Could not resolve credential paths: {_ce}")
+
         self.stats = {
-            "drives_total":       0,
-            "drives_created":     0,
-            "drives_failed":      0,
-            "files_migrated":     0,
-            "files_failed":       0,
-            "files_skipped":      0,
-            "files_ignored":      0,
-            "folders_created":    0,
-            "members_migrated":   0,
-            "members_failed":     0,
-            "gcs_routed":         0,
-            "memory_routed":      0,
-            "temp_memberships":   0,   # NEW: drives where admin was added temporarily
+            "drives_total":            0,
+            "drives_created":          0,
+            "drives_failed":           0,
+            "files_migrated":          0,
+            "files_failed":            0,
+            "files_skipped":           0,
+            "files_ignored":           0,
+            "folders_created":         0,
+            "members_migrated":        0,
+            "members_failed":          0,
+            "gcs_routed":              0,
+            "memory_routed":           0,
+            "temp_memberships":        0,
+            # PERF-8: Discovery-First permission optimisation counters
+            "perms_skipped_inherited": 0,   # items whose ACL is purely inherited → no API call
+            "perms_explicit_migrated": 0,   # items that truly had explicit ACL overrides
         }
 
-        # {source_drive_id: {source_folder_id: dest_folder_id}}
         self._folder_maps: Dict[str, Dict[str, str]] = {}
+        # FIX Bug-3: lock guards writes to _folder_maps from Phase-1 threads so
+        # Phase-2 workers never read a partially-written mapping for a drive.
+        self._folder_maps_lock = threading.Lock()
+
+        # Build skip-set ONCE: source admin + dest admin emails must NEVER be
+        # copied onto destination file/folder ACLs. They are TEMPORARY members
+        # at the source/dest Shared Drive ROOT only, added purely for migration
+        # access and revoked immediately after. Copying them to individual items
+        # would leave permanent ACL pollution after the root membership is revoked.
+        _skip_raw = {self._src_admin_email, self._dst_admin_email}
+        self._perm_skip_emails: frozenset = frozenset(
+            e.lower() for e in _skip_raw if e
+        )
+        if self._perm_skip_emails:
+            logger.info(
+                f"[INIT] Temp-admin skip-list (excluded from all dest item ACLs): "
+                f"{self._perm_skip_emails}"
+            )
+
+        # FIX Bug-1: thread-local cache for Drive services — mirrors
+        # migration_engine_v4._get_drive_service_for_thread().
+        # Previously _build_thread_drive_svc() was called on EVERY file with no
+        # caching, spending ~0.5–2 s per file on credential loading and HTTP
+        # object creation.  With 14 workers all burning that overhead in the
+        # first seconds, effective concurrency collapsed to ~1 transfer at a time.
+        self._thread_local = threading.local()
 
     # =========================================================================
-    # STEP 0 (NEW v4): Temporary admin membership helpers
+    # STEP 0: Temporary admin membership helpers
     # =========================================================================
 
     def _ensure_admin_access(
@@ -191,37 +486,14 @@ class SharedDriveMigrator:
         drive_id: str,
         drive_name: str,
     ) -> Tuple[bool, Optional[str]]:
-        """
-        Ensure the source admin account can access this Shared Drive.
-
-        Returns
-        ───────
-        (was_temporary, permission_id)
-          was_temporary=False, permission_id=None   → admin already a member
-          was_temporary=True,  permission_id=<str>  → admin added temporarily
-          was_temporary=False, permission_id=None   → check failed / no email
-                                                       configured (caller logs)
-
-        Strategy
-        ────────
-        1. List current drive-level permissions with useDomainAdminAccess=True.
-        2. If the admin email appears in any permission → already a member,
-           return (False, None).  Do NOT change anything.
-        3. Otherwise → add admin as 'organizer' and return (True, new_perm_id).
-           The 'organizer' role gives full read/write access needed for migration
-           without making the admin an owner.
-
-        File-level permissions are NEVER inspected or modified here.
-        """
         if not self._admin_email:
             logger.warning(
-                f"[TEMP-MEMBERSHIP] No admin email configured — "
+                f"[SRC-MEMBERSHIP] No source_admin_email configured — "
                 f"skipping membership check for '{drive_name}' ({drive_id}). "
-                "Set config.source_admin_email to enable automatic temporary membership."
+                "Set config.SOURCE_ADMIN_EMAIL to enable automatic temporary membership."
             )
             return False, None
 
-        # ── Step 1: Check existing membership ────────────────────────────────
         try:
             resp = self.source_drive.permissions().list(
                 fileId=drive_id,
@@ -232,7 +504,7 @@ class SharedDriveMigrator:
             existing_perms = resp.get("permissions", [])
         except HttpError as exc:
             logger.error(
-                f"[TEMP-MEMBERSHIP] Cannot list permissions for '{drive_name}': {exc}"
+                f"[SRC-MEMBERSHIP] Cannot list permissions for '{drive_name}': {exc}"
             )
             return False, None
 
@@ -241,15 +513,14 @@ class SharedDriveMigrator:
             perm_email = (perm.get("emailAddress") or "").lower()
             if perm_email == admin_lower:
                 logger.debug(
-                    f"[TEMP-MEMBERSHIP] Admin '{self._admin_email}' already a member "
-                    f"of '{drive_name}' with role='{perm.get('role')}' — no change."
+                    f"[SRC-MEMBERSHIP] Source admin '{self._admin_email}' already a "
+                    f"member of '{drive_name}' (role='{perm.get('role')}') — no change."
                 )
-                return False, None   # already a member, nothing to do
+                return False, None
 
-        # ── Step 2: Admin is NOT a member — add temporarily ──────────────────
         logger.info(
-            f"[TEMP-MEMBERSHIP] Admin '{self._admin_email}' is NOT a member of "
-            f"'{drive_name}' ({drive_id}) — adding temporary 'organizer' permission."
+            f"[SRC-MEMBERSHIP] Source admin '{self._admin_email}' is NOT a member of "
+            f"'{drive_name}' ({drive_id}) — adding temporary 'manager' permission."
         )
         try:
             new_perm = self.source_drive.permissions().create(
@@ -265,23 +536,24 @@ class SharedDriveMigrator:
                 fields="id",
             ).execute()
 
-            perm_id = new_perm.get("id")
+            # Guard: execute() can return None on HTTP-204 (empty body) responses
+            perm_id = (new_perm or {}).get("id")
             if perm_id:
                 logger.info(
-                    f"[TEMP-MEMBERSHIP] ✓ Temporary organizer added to '{drive_name}' "
-                    f"(permissionId={perm_id})"
+                    f"[SRC-MEMBERSHIP] ✓ Temporary manager added to SOURCE '{drive_name}' "
+                    f"(permissionId={perm_id}) — will be removed after migration."
                 )
                 self.stats["temp_memberships"] += 1
                 return True, perm_id
             else:
                 logger.warning(
-                    f"[TEMP-MEMBERSHIP] Permission create returned no id for '{drive_name}'"
+                    f"[SRC-MEMBERSHIP] permissions.create returned no id for '{drive_name}'"
                 )
                 return False, None
 
         except HttpError as exc:
             logger.error(
-                f"[TEMP-MEMBERSHIP] Failed to add admin to '{drive_name}': {exc}"
+                f"[SRC-MEMBERSHIP] Failed to add source admin to '{drive_name}': {exc}"
             )
             return False, None
 
@@ -291,18 +563,11 @@ class SharedDriveMigrator:
         drive_name: str,
         permission_id: str,
     ) -> None:
-        """
-        Remove the temporary admin permission added by _ensure_admin_access().
-
-        Called in a `finally` block so cleanup always runs regardless of whether
-        migration succeeded or failed.  File-level permissions are not touched.
-        """
         if not permission_id:
             return
-
         logger.info(
-            f"[TEMP-MEMBERSHIP] Removing temporary permission '{permission_id}' "
-            f"from '{drive_name}' ({drive_id})..."
+            f"[SRC-MEMBERSHIP] Removing temporary manager permission '{permission_id}' "
+            f"from SOURCE '{drive_name}' ({drive_id})..."
         )
         try:
             self.source_drive.permissions().delete(
@@ -312,14 +577,154 @@ class SharedDriveMigrator:
                 useDomainAdminAccess=True,
             ).execute()
             logger.info(
-                f"[TEMP-MEMBERSHIP] ✓ Temporary membership removed from '{drive_name}'"
+                f"[SRC-MEMBERSHIP] ✓ Temporary manager removed from SOURCE '{drive_name}'"
             )
         except HttpError as exc:
-            # Log but do not raise — we never want cleanup to mask migration errors.
             logger.warning(
-                f"[TEMP-MEMBERSHIP] Could not remove temp permission from "
+                f"[SRC-MEMBERSHIP] Could not remove temp manager from "
                 f"'{drive_name}' (permissionId={permission_id}): {exc} — "
-                "you may need to remove it manually."
+                "remove manually if needed."
+            )
+
+    def _ensure_dest_admin_organizer(
+        self,
+        dest_drive_id: str,
+        drive_name: str,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Add the destination admin as a TEMPORARY Organizer on the destination
+        Shared Drive — mirroring enterprise migration tools like CloudM.
+
+        Returns: (was_added_temporarily, permission_id, original_role)
+
+          was_added_temporarily=True  → admin was NOT pre-existing; we added
+                                        them; caller MUST revoke after migration.
+          was_added_temporarily=False → admin already existed (or error);
+                                        do NOT revoke — preserve original role.
+          permission_id               → id of the *newly created* permission
+                                        (None when was_added_temporarily=False).
+          original_role               → role the admin already had before we ran
+                                        (None when admin was absent).
+
+        CONTRACT:
+          - Only touches the Shared Drive root membership (permissions.create
+            fileId=sharedDriveId) — never individual file/folder ACLs.
+          - Does NOT downgrade or modify a pre-existing organizer/manager role.
+        """
+        dest_admin_email: Optional[str] = (
+            getattr(self.config, "DEST_ADMIN_EMAIL", None)
+            or getattr(self.config, "dest_admin_email", None)
+            or getattr(self.config, "admin_email", None)
+        )
+
+        if not dest_admin_email:
+            logger.warning(
+                f"[DEST-MEMBERSHIP] No dest_admin_email configured — "
+                f"skipping organizer add on destination '{drive_name}' ({dest_drive_id}). "
+                "Set config.DEST_ADMIN_EMAIL to enable."
+            )
+            return False, None, None
+
+        try:
+            resp = self.dest_drive.permissions().list(
+                fileId=dest_drive_id,
+                supportsAllDrives=True,
+                useDomainAdminAccess=True,
+                fields="permissions(id,emailAddress,type,role)",
+            ).execute()
+            existing_perms = resp.get("permissions", [])
+        except HttpError as exc:
+            logger.error(
+                f"[DEST-MEMBERSHIP] Cannot list dest permissions for '{drive_name}': {exc}"
+            )
+            return False, None, None
+
+        dest_admin_lower = dest_admin_email.lower()
+        for perm in existing_perms:
+            perm_email = (perm.get("emailAddress") or "").lower()
+            if perm_email == dest_admin_lower:
+                original_role = perm.get("role")
+                logger.info(
+                    f"[DEST-MEMBERSHIP] Dest admin '{dest_admin_email}' is already a "
+                    f"member of destination '{drive_name}' "
+                    f"(role='{original_role}') — preserving existing role, "
+                    "will NOT revoke after migration."
+                )
+                # Pre-existing member: caller must NOT revoke
+                return False, None, original_role
+
+        # Admin is NOT a current member — add as temporary Organizer
+        logger.info(
+            f"[DEST-MEMBERSHIP] Dest admin '{dest_admin_email}' is NOT a member of "
+            f"destination '{drive_name}' ({dest_drive_id}) — adding TEMPORARY "
+            "'organizer' access for migration duration."
+        )
+        try:
+            new_perm = self.dest_drive.permissions().create(
+                fileId=dest_drive_id,
+                supportsAllDrives=True,
+                useDomainAdminAccess=True,
+                sendNotificationEmail=False,
+                body={
+                    "type":         "user",
+                    "role":         "organizer",
+                    "emailAddress": dest_admin_email,
+                },
+                fields="id",
+            ).execute()
+
+            # Guard: execute() can return None on HTTP-204 (empty body) responses
+            perm_id = (new_perm or {}).get("id")
+            if perm_id:
+                logger.info(
+                    f"[DEST-MEMBERSHIP] ✓ Temporary organizer added to DESTINATION "
+                    f"'{drive_name}' (permissionId={perm_id}) — "
+                    "WILL be revoked after migration completes."
+                )
+                self.stats["temp_memberships"] += 1
+                return True, perm_id, None
+            else:
+                logger.warning(
+                    f"[DEST-MEMBERSHIP] permissions.create returned no id for "
+                    f"destination '{drive_name}'"
+                )
+                return False, None, None
+
+        except HttpError as exc:
+            logger.error(
+                f"[DEST-MEMBERSHIP] Failed to add dest admin to '{drive_name}': {exc}"
+            )
+            return False, None, None
+
+    def _revoke_dest_admin_access(
+        self,
+        dest_drive_id: str,
+        drive_name: str,
+        permission_id: str,
+    ) -> None:
+        """Remove the temporary destination-admin Organizer added before migration."""
+        if not permission_id:
+            return
+        logger.info(
+            f"[DEST-MEMBERSHIP] Removing temporary organizer permission '{permission_id}' "
+            f"from DESTINATION '{drive_name}' ({dest_drive_id})..."
+        )
+        try:
+            self.dest_drive.permissions().delete(
+                fileId=dest_drive_id,
+                permissionId=permission_id,
+                supportsAllDrives=True,
+                useDomainAdminAccess=True,
+            ).execute()
+            logger.info(
+                f"[DEST-MEMBERSHIP] ✓ Temporary organizer removed from DESTINATION "
+                f"'{drive_name}'"
+            )
+        except HttpError as exc:
+            logger.warning(
+                f"[DEST-MEMBERSHIP] Could not remove temp organizer from "
+                f"'{drive_name}' (permissionId={permission_id}): {exc} — "
+                "remove manually if needed."
             )
 
     # =========================================================================
@@ -327,6 +732,12 @@ class SharedDriveMigrator:
     # =========================================================================
 
     def list_source_shared_drives(self) -> List[Dict]:
+        """
+        List all Shared Drives in the source domain.
+
+        PERF-3: removed the 0.3 s per-page sleep that previously added
+        0.3 s × N_pages of dead idle before Phase 1 could start.
+        """
         drives     = []
         page_token = None
 
@@ -335,7 +746,7 @@ class SharedDriveMigrator:
         while True:
             try:
                 resp = self.source_drive.drives().list(
-                    pageSize=100,
+                    pageSize=DRIVES_LIST_PAGE_SIZE,
                     pageToken=page_token,
                     fields="nextPageToken, drives(id, name, createdTime, restrictions)",
                     useDomainAdminAccess=True,
@@ -348,8 +759,7 @@ class SharedDriveMigrator:
                 page_token = resp.get("nextPageToken")
                 if not page_token:
                     break
-
-                time.sleep(0.3)
+                # PERF-3: no sleep between pages — removed 0.3 s × N_pages idle
 
             except HttpError as exc:
                 logger.error(f"Failed to list shared drives: {exc}")
@@ -402,6 +812,15 @@ class SharedDriveMigrator:
     # =========================================================================
 
     def list_shared_drive_files(self, drive_id: str) -> List[Dict]:
+        """
+        List all files/folders inside a Shared Drive.
+
+        PERF-2: pageSize raised from 200 → 1000 (FILES_LIST_PAGE_SIZE) and the
+        0.2 s per-page sleep removed.  For a drive with 1000 files this cuts
+        5 pages + 5 × 0.2 s = 1 s of forced idle down to 1 page + 0 s idle.
+        The Drive API enforces its own rate limits server-side; we don't need a
+        client-side sleep that only adds latency without preventing 429s.
+        """
         files      = []
         page_token = None
 
@@ -419,9 +838,14 @@ class SharedDriveMigrator:
                     fields=(
                         "nextPageToken, files("
                         "id, name, mimeType, size, parents, "
-                        "createdTime, modifiedTime)"
+                        "createdTime, modifiedTime, "
+                        # PERF-8 Discovery-First: these two fields arrive FREE in
+                        # files.list and let us skip permissions().list() for the
+                        # majority of items that carry only inherited ACLs.
+                        "hasExplicitRoles, "
+                        "capabilities/canShare)"
                     ),
-                    pageSize=200,
+                    pageSize=FILES_LIST_PAGE_SIZE,   # PERF-2: was 200
                     pageToken=page_token,
                 ).execute()
 
@@ -431,8 +855,7 @@ class SharedDriveMigrator:
                 page_token = resp.get("nextPageToken")
                 if not page_token:
                     break
-
-                time.sleep(0.2)
+                # PERF-2: no sleep between pages — removed 0.2 s × N_pages idle
 
             except HttpError as exc:
                 logger.error(f"Failed to list files in drive {drive_id}: {exc}")
@@ -442,7 +865,7 @@ class SharedDriveMigrator:
         return files
 
     # =========================================================================
-    # STEP 4: Migrate drive-level members — UNCHANGED from v3
+    # STEP 4: Migrate drive-level members
     # =========================================================================
 
     def migrate_drive_members(
@@ -460,12 +883,30 @@ class SharedDriveMigrator:
                 useDomainAdminAccess=True,
                 fields="permissions(id,type,role,emailAddress,domain,displayName)",
             ).execute()
-            permissions = resp.get("permissions", [])
-            logger.info(f"  {len(permissions)} members in '{drive_name}'")
+            all_permissions = resp.get("permissions", [])
+            logger.info(f"  {len(all_permissions)} members in '{drive_name}'")
 
         except Exception as exc:
             logger.error(f"Failed to list members for '{drive_name}': {exc}")
             return result
+
+        # Filter out temp-admin accounts from drive-level membership.
+        # The source admin was added temporarily to the SOURCE drive root to allow
+        # crawling — that temporary membership must NOT be mirrored onto the
+        # DESTINATION drive root either.
+        if self._perm_skip_emails:
+            permissions = [
+                p for p in all_permissions
+                if (p.get("emailAddress") or "").lower() not in self._perm_skip_emails
+            ]
+            skipped = len(all_permissions) - len(permissions)
+            if skipped:
+                logger.info(
+                    f"  [MEMBERS] Filtered {skipped} temp-admin permission(s) "
+                    f"from drive-level migration for '{drive_name}'"
+                )
+        else:
+            permissions = all_permissions
 
         try:
             from permissions_migrator import EnhancedPermissionsMigrator
@@ -482,6 +923,7 @@ class SharedDriveMigrator:
                 dest_drive_id,
                 permissions,
                 shared_drive_mode=True,
+                is_drive_root=True,   # drive root: keep 'organizer', don't downgrade
             )
 
             result["migrated"] = pr.get("migrated", 0)
@@ -529,14 +971,13 @@ class SharedDriveMigrator:
         return result
 
     def _map_email(self, source_email: str) -> str:
-        """Map source-domain email to dest domain; keep external as-is."""
         if source_email.endswith(f"@{self.source_domain}"):
             local = source_email.split("@")[0]
             return f"{local}@{self.dest_domain}"
         return source_email
 
     # =========================================================================
-    # STEP 5: Folder structure builder — UNCHANGED from v3
+    # STEP 5: Folder structure builder
     # =========================================================================
 
     def _build_shared_drive_folder_structure(
@@ -545,10 +986,6 @@ class SharedDriveMigrator:
         source_drive_id: str,
         dest_drive_id: str,
     ) -> Dict[str, str]:
-        """
-        Build folder hierarchy inside destination Shared Drive.
-        Returns {source_folder_id: dest_folder_id}.
-        """
         folder_mapping: Dict[str, str] = {}
         sorted_folders = self._sort_folders_by_hierarchy(folders)
 
@@ -557,7 +994,6 @@ class SharedDriveMigrator:
             fname = folder["name"]
             pids  = folder.get("parents", [])
 
-            # Resume: if already created, reuse
             cached = self.mgr._cache.get(fid)
             if cached and cached.dest_folder_id:
                 folder_mapping[fid] = cached.dest_folder_id
@@ -572,7 +1008,6 @@ class SharedDriveMigrator:
 
             self.mgr.mark_in_progress(self.run_id, fid)
 
-            # Resolve destination parent
             dest_parent = dest_drive_id
             if pids:
                 parent_src = pids[0]
@@ -594,7 +1029,24 @@ class SharedDriveMigrator:
                 self.stats["folders_created"] += 1
                 logger.debug(f"  ✓ Folder: {fname}")
 
-                self._migrate_item_permissions(fid, dest_fid, fname, "FOLDER", dest_drive_id)
+                # ── PERF-8: Discovery-First permission gate ────────────────────
+                # hasExplicitRoles is True only when the folder carries at least
+                # one ACL entry that is NOT inherited from the Shared Drive root.
+                # When False, drive-level members already propagate via inheritance
+                # in the destination — no permissions().list() call needed.
+                has_explicit = folder.get("hasExplicitRoles", False)
+                if has_explicit:
+                    self.stats["perms_explicit_migrated"] += 1
+                    self._migrate_item_permissions(
+                        fid, dest_fid, fname, "FOLDER", dest_drive_id,
+                        has_explicit_roles=True,
+                    )
+                else:
+                    self.stats["perms_skipped_inherited"] += 1
+                    logger.debug(
+                        f"  [PERMS-SKIP] Folder '{fname}' has no explicit roles "
+                        f"— relying on Shared Drive inheritance (saved 1 API call)"
+                    )
             else:
                 self.mgr.mark_failed(self.run_id, fid, "Failed to create folder")
                 logger.error(f"  ✗ Folder failed: {fname}")
@@ -638,9 +1090,7 @@ class SharedDriveMigrator:
                     return None
         return None
 
-    def _find_existing_folder(
-        self, name: str, parent_id: str
-    ) -> Optional[str]:
+    def _find_existing_folder(self, name: str, parent_id: str) -> Optional[str]:
         try:
             resp = self.dest_drive.files().list(
                 q=(
@@ -658,7 +1108,6 @@ class SharedDriveMigrator:
             return None
 
     def _sort_folders_by_hierarchy(self, folders: List[Dict]) -> List[Dict]:
-        """Topological sort — parents always before children."""
         folder_ids = {f["id"] for f in folders}
         result:  List[Dict] = []
         visited: set        = set()
@@ -681,7 +1130,7 @@ class SharedDriveMigrator:
         return result
 
     # =========================================================================
-    # STEP 6: Item permissions — UNCHANGED from v3
+    # STEP 6: Item permissions
     # =========================================================================
 
     def _migrate_item_permissions(
@@ -691,37 +1140,78 @@ class SharedDriveMigrator:
         name: str,
         item_type: str,
         parent_drive_id: str,
+        src_drive=None,   # BUG-FIX: accept thread-local service to avoid shared httplib2
+        dst_drive=None,
+        has_explicit_roles: Optional[bool] = None,  # PERF-8: Discovery-First fast path
     ):
-        """
-        Hybrid model:
-        1. Fetch permissions from source API (always fresh)
-        2. Apply to destination via EnhancedPermissionsMigrator
-        3. Track each result in migration_permissions SQL table
+        # BUG-FIX: use thread-local services when provided — self.source_drive is
+        # shared across ALL threads and httplib2 is NOT thread-safe, causing the
+        # 240-950s migrate_perms stalls and NoneType.close crashes seen in pm2 logs.
+        _src = src_drive or self.source_drive
+        _dst = dst_drive or self.dest_drive
 
-        NOTE: This method is only called for files/folders that already have
-        explicit permissions beyond drive-level membership. The admin's temporary
-        drive-level membership does NOT cause the admin to appear in per-file
-        permission lists, so no admin permission is accidentally propagated here.
-        """
+        # ── PERF-8: Discovery-First fast path ─────────────────────────────────
+        # If the caller already resolved hasExplicitRoles from the files.list()
+        # metadata, honour it immediately — no Drive API call required.
+        #
+        # has_explicit_roles=False → item inherits all ACLs from the Shared Drive
+        #   root which was already migrated by migrate_drive_members().  Destination
+        #   inheritance propagates those roles automatically; there is nothing to do.
+        #
+        # has_explicit_roles=True  → item carries at least one explicit ACL override
+        #   (e.g. a specific user was granted access directly to this file/folder).
+        #   Fall through to the normal permissions().list() + migrate path below.
+        #
+        # has_explicit_roles=None  → caller did not supply the hint (e.g. resume run
+        #   from SQL where the field may not have been stored).  Fall through to the
+        #   old logic which fetches permissions and checks len(perms) <= 1.
+        if has_explicit_roles is False:
+            logger.debug(
+                f"  [PERMS-SKIP] {item_type} '{name}' hasExplicitRoles=False "
+                "— no explicit ACL overrides, relying on Shared Drive inheritance."
+            )
+            return
+
         try:
-            resp = self.source_drive.permissions().list(
+            resp = _src.permissions().list(
                 fileId=source_id,
                 fields="permissions(id,type,role,emailAddress,domain,displayName)",
                 supportsAllDrives=True,
             ).execute()
+            if resp is None:
+                logger.debug(f"  [ITEM-PERMS] permissions.list returned None for [{name}] — skipping")
+                return
             perms = resp.get("permissions", [])
             if len(perms) <= 1:
                 return
         except Exception as exc:
             logger.warning(f"  Permissions list failed [{name}]: {exc}")
             return
+        # Strip temp-admin emails from item-level ACLs using the instance-level
+        # skip-set built in __init__. Source admin + dest admin must never appear
+        # in destination file/folder ACLs — their access is drive-root only.
+        if self._perm_skip_emails:
+            filtered = [
+                p for p in perms
+                if (p.get("emailAddress") or "").lower() not in self._perm_skip_emails
+            ]
+            skipped_count = len(perms) - len(filtered)
+            if skipped_count:
+                logger.debug(
+                    f"  [ITEM-PERMS] Excluded {skipped_count} temp-admin "
+                    f"permission(s) from [{name}] — admin access is drive-root only."
+                )
+            perms = filtered
+
+        if len(perms) <= 1:
+            return
 
         try:
             from permissions_migrator import EnhancedPermissionsMigrator
 
             pm = EnhancedPermissionsMigrator(
-                self.source_drive,
-                self.dest_drive,
+                _src,   # BUG-FIX: thread-local, not self.source_drive
+                _dst,   # BUG-FIX: thread-local, not self.dest_drive
                 self.source_domain,
                 self.dest_domain,
             )
@@ -745,12 +1235,12 @@ class SharedDriveMigrator:
                 if role == "owner":
                     continue
 
-                if item_type in ("FILE", "FOLDER") and role == "organizer":
-                    logger.debug(
-                        f"  Skipping 'organizer' role for [{name}] "
-                        "— only valid at drive level"
-                    )
-                    continue
+                # NOTE: Do NOT skip 'organizer' here.
+                # permissions_migrator.migrate_permissions() already downgrades
+                # 'organizer' → 'fileOrganizer' for all item-level ACLs before
+                # making any API call (shared_drive_mode=True, FIX-1).
+                # The old guard here was incorrectly dropping fileOrganizer DB
+                # upserts after the downgrade had already happened.
 
                 valid_roles = {
                     "owner", "organizer", "fileOrganizer",
@@ -809,22 +1299,13 @@ class SharedDriveMigrator:
         dst_id: str,
         drive_name: str,
     ) -> Dict:
-        """
-        Phase 1 worker (one per Shared Drive).
-        - Lists all items from source drive.
-        - Registers them in SQL (INSERT IGNORE — safe for resume).
-        - Builds folder hierarchy on destination.
-        - Stores folder_map in self._folder_maps[src_id].
-
-        Returns a summary dict used for Phase 2 aggregation.
-        """
         result = {
-            "source_id":      src_id,
-            "dest_id":        dst_id,
-            "name":           drive_name,
-            "files_total":    0,
+            "source_id":       src_id,
+            "dest_id":         dst_id,
+            "name":            drive_name,
+            "files_total":     0,
             "folders_created": 0,
-            "status":         "ok",
+            "status":          "ok",
         }
 
         try:
@@ -893,7 +1374,10 @@ class SharedDriveMigrator:
                     folders, src_id, dst_id
                 )
 
-            self._folder_maps[src_id] = folder_mapping
+            # FIX Bug-3: guard write with lock so Phase-2 workers never read a
+            # partially-written mapping when drives finish discovery at different times.
+            with self._folder_maps_lock:
+                self._folder_maps[src_id] = folder_mapping
 
             result["files_total"]     = len(files)
             result["folders_created"] = len(folder_mapping)
@@ -912,25 +1396,272 @@ class SharedDriveMigrator:
         return result
 
     # =========================================================================
-    # Phase 2: per-item file migration (memory OR GCS path)
+    # Thread-local Drive service builder
+    # =========================================================================
+
+    def _get_thread_drive_svc(self, kind: str = "source"):
+        """
+        Return a per-thread CACHED Drive v3 service (build once, reuse forever).
+
+        FIX Bug-1: previously _build_thread_drive_svc() built a *brand-new*
+        service on every single file — credential loading + httplib2.Http
+        creation + Discovery fetch costs ~0.5-2 s each time.  With 14 workers
+        all doing this in their first calls, all threads were blocked in setup
+        instead of transferring, making migration appear single-threaded.
+
+        Solution (mirrors migration_engine_v4._get_drive_service_for_thread):
+          - Use threading.local() to store one service per thread per kind.
+          - Build it only on the first call from that thread; reuse on all
+            subsequent calls.  httplib2 is still NOT shared across threads
+            (each thread has its own Http object), so thread-safety is preserved.
+        """
+        cache_attr = f"_drive_svc_{kind}"
+        cached = getattr(self._thread_local, cache_attr, None)
+        if cached is not None:
+            return cached
+
+        import httplib2
+        from google.oauth2 import service_account as _sa
+        from googleapiclient.discovery import build as _gapi_build
+
+        creds_file  = self._src_creds_file  if kind == "source" else self._dst_creds_file
+        admin_email = self._src_admin_email  if kind == "source" else self._dst_admin_email
+
+        if not creds_file or not admin_email:
+            logger.warning(
+                f"[THREAD-SVC] No creds for kind={kind!r} — "
+                "falling back to shared service (thread-unsafe)"
+            )
+            svc = self.source_drive if kind == "source" else self.dest_drive
+            setattr(self._thread_local, cache_attr, svc)
+            return svc
+
+        creds = _sa.Credentials.from_service_account_file(
+            creds_file,
+            scopes=self.config.SCOPES,
+            subject=admin_email,
+        )
+        try:
+            import google_auth_httplib2 as _gah
+            http = _gah.AuthorizedHttp(creds, http=httplib2.Http(timeout=1800))
+            svc = _gapi_build("drive", "v3", http=http, cache_discovery=False)
+        except ImportError:
+            svc = _gapi_build("drive", "v3", credentials=creds, cache_discovery=False)
+
+        setattr(self._thread_local, cache_attr, svc)
+        logger.debug(
+            f"[THREAD-SVC] Built+cached Drive svc kind={kind!r} "
+            f"thread={threading.current_thread().name}"
+        )
+        return svc
+
+    # Backward-compat alias so any external callers are not broken
+    def _build_thread_drive_svc(self, kind: str = "source"):
+        return self._get_thread_drive_svc(kind)
+
+    # =========================================================================
+    # Workspace file helpers (FIX v7: mirrors migration_engine_v4 fully)
+    # =========================================================================
+
+    def _migrate_workspace_file(
+        self,
+        file_id: str,
+        file_name: str,
+        mime_type: str,
+        dest_parent_id: Optional[str],
+        dest_drive_id: str,
+        src_drive,
+        dst_drive,
+    ) -> Dict:
+        """Export a Google Workspace file, with PDF fallback for oversized exports."""
+        empty     = {"success": False, "dest_id": None, "ignored": False, "error": None}
+        type_info = GOOGLE_WORKSPACE_TYPES.get(mime_type)
+
+        if not type_info or not type_info.get("can_export"):
+            return {**empty, "ignored": True,
+                    "error": f"Non-exportable workspace type: {mime_type}",
+                    "error_type": "non_exportable"}
+
+        for attempt in range(MAX_RETRIES):
+            wait   = _backoff(attempt)
+            chunk  = _get_adaptive_chunk_size()
+            dl_buf = None
+            try:
+                req    = src_drive.files().export_media(
+                    fileId=file_id, mimeType=type_info["export_mime"]
+                )
+                dl_buf = io.BytesIO()
+                try:
+                    dl   = MediaIoBaseDownload(dl_buf, req, chunksize=chunk)
+                    done = False
+                    while not done:
+                        _, done = dl.next_chunk()
+                    dl_buf.seek(0)
+                    data = dl_buf.read()
+                finally:
+                    dl_buf.close()
+                    dl_buf = None
+
+                if not data:
+                    return {**empty, "error": "Empty export", "error_type": "empty_export"}
+
+                dest_name = file_name + type_info["extension"]
+                meta      = {"name": dest_name}
+                if dest_parent_id:
+                    meta["parents"] = [dest_parent_id]
+                elif dest_drive_id:
+                    meta["parents"] = [dest_drive_id]
+                if type_info.get("import_mime"):
+                    meta["mimeType"] = type_info["import_mime"]
+
+                upload_buf = io.BytesIO(data)
+                try:
+                    use_resumable = len(data) >= 5 * 1_024 * 1_024
+                    media = MediaIoBaseUpload(
+                        upload_buf, mimetype=type_info["export_mime"],
+                        resumable=use_resumable,
+                        chunksize=chunk if use_resumable else -1,
+                    )
+                    resp = dst_drive.files().create(
+                        body=meta, media_body=media,
+                        fields="id", supportsAllDrives=True,
+                    ).execute()
+                finally:
+                    upload_buf.close()
+
+                dest_id = _extract_id(resp)
+                if dest_id is None:
+                    return {**empty, "error": f"Bad response: {resp!r}",
+                            "error_type": "bad_response"}
+                self.stats["memory_routed"] += 1
+                return {**empty, "success": True, "dest_id": dest_id}
+
+            except HttpError as exc:
+                err  = str(exc)
+                code = exc.resp.status
+
+                # FIX-2: exportSizeLimitExceeded → retry as PDF for Presentations/Drawings
+                if "exportSizeLimitExceeded" in err:
+                    if "fallback_mime" in type_info:
+                        logger.warning(
+                            f"  [WORKSPACE] [{file_name}] exportSizeLimitExceeded — "
+                            f"retrying as {type_info['fallback_ext']}"
+                        )
+                        return self._workspace_fallback(
+                            file_id, file_name, type_info,
+                            dest_parent_id, dest_drive_id, src_drive, dst_drive,
+                        )
+                    logger.warning(
+                        f"  [WORKSPACE] [{file_name}] exportSizeLimitExceeded and no "
+                        f"fallback defined for {mime_type} — marking ignored"
+                    )
+                    return {**empty, "ignored": True,
+                            "error": f"exportSizeLimitExceeded: {err}"}
+
+                if code in (429, 500, 503) and attempt < MAX_RETRIES - 1:
+                    time.sleep(wait)
+                    continue
+                return {**empty, "error": err, "error_type": f"http_{code}"}
+
+            except Exception as exc:
+                err = str(exc)
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(wait)
+                else:
+                    return {**empty, "error": err,
+                            "error_type": "workspace_export_failed"}
+
+            finally:
+                if dl_buf is not None:
+                    try:
+                        dl_buf.close()
+                    except Exception:
+                        pass
+                    dl_buf = None
+
+        return {**empty, "error": "Max retries exceeded",
+                "error_type": "workspace_export_failed"}
+
+    def _workspace_fallback(
+        self,
+        file_id: str,
+        file_name: str,
+        type_info: Dict,
+        dest_parent_id: Optional[str],
+        dest_drive_id: str,
+        src_drive,
+        dst_drive,
+    ) -> Dict:
+        """Retry a workspace export as PDF when the primary format exceeds size limit."""
+        empty  = {"success": False, "dest_id": None, "ignored": False, "error": None}
+        dl_buf = None
+        try:
+            req    = src_drive.files().export_media(
+                fileId=file_id, mimeType=type_info["fallback_mime"]
+            )
+            dl_buf = io.BytesIO()
+            try:
+                dl   = MediaIoBaseDownload(dl_buf, req, chunksize=CHUNK_SIZE)
+                done = False
+                while not done:
+                    _, done = dl.next_chunk()
+                dl_buf.seek(0)
+                data = dl_buf.read()
+            finally:
+                dl_buf.close()
+                dl_buf = None
+
+            if not data:
+                return {**empty, "error": "Empty fallback export",
+                        "error_type": "empty_export"}
+
+            meta = {"name": file_name + type_info["fallback_ext"]}
+            if dest_parent_id:
+                meta["parents"] = [dest_parent_id]
+            elif dest_drive_id:
+                meta["parents"] = [dest_drive_id]
+
+            upload_buf = io.BytesIO(data)
+            try:
+                use_resumable = len(data) >= 5 * 1_024 * 1_024
+                media = MediaIoBaseUpload(
+                    upload_buf, mimetype=type_info["fallback_mime"],
+                    resumable=use_resumable,
+                    chunksize=CHUNK_SIZE if use_resumable else -1,
+                )
+                resp = dst_drive.files().create(
+                    body=meta, media_body=media,
+                    fields="id", supportsAllDrives=True,
+                ).execute()
+            finally:
+                upload_buf.close()
+
+            dest_id = _extract_id(resp)
+            if dest_id is None:
+                return {**empty, "error": f"Bad response: {resp!r}",
+                        "error_type": "bad_response"}
+            return {**empty, "success": True, "dest_id": dest_id}
+
+        except Exception as exc:
+            return {**empty, "error": str(exc),
+                    "error_type": "workspace_fallback_failed"}
+        finally:
+            if dl_buf is not None:
+                try:
+                    dl_buf.close()
+                except Exception:
+                    pass
+
+    # =========================================================================
+    # Phase 2: per-item file migration worker
     # =========================================================================
 
     def _process_queue_item(self, item) -> Dict:
-        """
-        Phase 2 worker.  `item` is a MigrationRecord from sql_state_manager.
-
-        Routing:
-          - ignored MIME          → mark_ignored, return
-          - already done/skipped  → return skipped
-          - size < 50 MB          → _migrate_via_memory()
-          - size >= 50 MB         → _migrate_via_gcs()
-        After success, calls _migrate_item_permissions().
-        """
         file_id      = item.file_id
-        file_name    = getattr(item, "file_name",        "") or ""
-        mime_type    = getattr(item, "mime_type",         "") or ""
-        file_size    = int(getattr(item, "file_size_bytes", 0) or 0)
-        parent_id    = getattr(item, "source_parent_id",  None)
+        file_name    = getattr(item, "file_name",             "") or ""
+        mime_type    = getattr(item, "mime_type",              "") or ""
+        file_size    = int(getattr(item, "file_size_bytes",    0) or 0)
+        parent_id    = getattr(item, "source_parent_id",       None)
         src_drive_id = getattr(item, "source_shared_drive_id", "") or ""
 
         base = {
@@ -938,31 +1669,72 @@ class SharedDriveMigrator:
             "source_drive_id": src_drive_id, "file_name": file_name,
         }
 
-        # Ignored MIME types
+        # Ignore non-migratable MIME types
         if mime_type in IGNORED_MIME_TYPES:
             self.mgr.mark_ignored(self.run_id, file_id, "Non-migratable MIME type")
             return {**base, "ignored": True}
 
-        # Resume guard
+        # FIX (v7): Hard 5 GB size limit — mirrors migration_engine_v4 FIX-7.
+        # Attempting files this large via the Drive API always times out or
+        # exceeds memory; mark them ignored immediately.
+        if file_size > MAX_FILE_SIZE_BYTES:
+            reason = f"File size {_fmt_bytes(file_size)} exceeds 5 GB limit — ignored"
+            logger.warning(f"[SIZE-LIMIT] {file_name} ({file_id}): {reason}")
+            self.mgr.mark_ignored(self.run_id, file_id, reason)
+            return {**base, "ignored": True}
+
         should_skip, _ = self.mgr.should_skip_item(file_id)
         if should_skip:
             return {**base, "skipped": True}
 
-        # Resolve destination parent from per-drive folder map
-        fm          = self._folder_maps.get(src_drive_id, {})
+        fm           = self._folder_maps.get(src_drive_id, {})
         dst_drive_id = getattr(item, "dest_shared_drive_id", "") or ""
-        dest_parent  = fm.get(parent_id, dst_drive_id) if parent_id else dst_drive_id
+
+        _at_drive_root = (not parent_id) or (parent_id == src_drive_id)
+
+        if _at_drive_root:
+            # FIX-A: Root-level files must land in the Shared Drive root.
+            # Passing None here causes the Drive API to place the file in the
+            # Service Account's personal "My Drive" instead of the Shared Drive.
+            # Always set parent = dest Shared Drive ID for root-level items.
+            dest_parent = dst_drive_id
+        else:
+            dest_parent = fm.get(parent_id)
+            if not dest_parent:
+                # Safety lock: nested file's parent folder not yet created.
+                # Block migration rather than letting the file land at drive root.
+                reason = (
+                    f"Safety lock: dest_folder_id missing for source parent "
+                    f"'{parent_id}'. Phase-1 folder creation may be incomplete. "
+                    "Re-run migration to retry after the parent folder is created."
+                )
+                logger.error(f"  [PARENT-LOCK] {file_name} ({file_id}): {reason}")
+                self.mgr.mark_failed(self.run_id, file_id, reason)
+                return {**base, "error": reason, "error_type": "missing_dest_folder"}
+
+        # Build thread-local Drive services — httplib2 is NOT thread-safe.
+        thread_src_drive = self._build_thread_drive_svc("source")
+        thread_dst_drive = self._build_thread_drive_svc("dest")
 
         self.mgr.mark_in_progress(self.run_id, file_id)
 
-        # Route by size
-        if file_size >= LARGE_FILE_THRESHOLD_BYTES:
+        # FIX (v7): route workspace files through proper workspace handler
+        # (with PDF fallback) instead of through the binary memory path.
+        if mime_type in GOOGLE_WORKSPACE_TYPES:
+            res = self._migrate_workspace_file(
+                file_id, file_name, mime_type,
+                dest_parent, dst_drive_id,
+                src_drive=thread_src_drive, dst_drive=thread_dst_drive,
+            )
+        elif file_size >= LARGE_FILE_THRESHOLD_BYTES:
             res = self._migrate_via_gcs(
-                file_id, file_name, mime_type, file_size, dest_parent
+                file_id, file_name, mime_type, file_size, dest_parent, dst_drive_id,
+                src_drive=thread_src_drive, dst_drive=thread_dst_drive,
             )
         else:
             res = self._migrate_via_memory(
-                file_id, file_name, mime_type, file_size, dest_parent
+                file_id, file_name, mime_type, file_size, dest_parent, dst_drive_id,
+                src_drive=thread_src_drive, dst_drive=thread_dst_drive,
             )
 
         if res["success"]:
@@ -973,9 +1745,32 @@ class SharedDriveMigrator:
                 dest_parent_id=dest_parent,
             )
             if dest_id:
-                self._migrate_item_permissions(
-                    file_id, dest_id, file_name, "FILE", dst_drive_id
-                )
+                # ── PERF-8: Discovery-First permission gate ────────────────────
+                # Retrieve hasExplicitRoles that was stored on the queue item
+                # by register_discovered_items() (sourced from files.list fields).
+                # If the state manager didn't persist this field (older schema or
+                # resume run) item.has_explicit_roles will be None — fall through
+                # to the normal flow inside _migrate_item_permissions which uses
+                # the len(perms) <= 1 guard as the fallback safety net.
+                has_explicit = getattr(item, "has_explicit_roles", None)
+
+                if has_explicit is False:
+                    # Item's ACL is purely inherited from the Shared Drive root.
+                    # Drive-level members were already migrated by
+                    # migrate_drive_members(); no per-item API call needed.
+                    self.stats["perms_skipped_inherited"] += 1
+                    logger.debug(
+                        f"  [PERMS-SKIP] FILE '{file_name}' hasExplicitRoles=False "
+                        "— relying on Shared Drive inheritance (saved 1 API call)"
+                    )
+                else:
+                    if has_explicit is True:
+                        self.stats["perms_explicit_migrated"] += 1
+                    self._migrate_item_permissions(
+                        file_id, dest_id, file_name, "FILE", dst_drive_id,
+                        src_drive=thread_src_drive, dst_drive=thread_dst_drive,
+                        has_explicit_roles=has_explicit,
+                    )
             return {**base, "success": True, "dest_id": dest_id}
 
         elif res.get("ignored"):
@@ -984,10 +1779,10 @@ class SharedDriveMigrator:
         else:
             err = res.get("error", "Unknown")
             self.mgr.mark_failed(self.run_id, file_id, err)
-            return {**base, "error": err}
+            return {**base, "error": err, "error_type": res.get("error_type", "")}
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Memory path  (< 50 MB)
+    # Memory path  (< LARGE_FILE_THRESHOLD_BYTES, binary files only)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _migrate_via_memory(
@@ -996,46 +1791,35 @@ class SharedDriveMigrator:
         file_name: str,
         mime_type: str,
         file_size: int,
-        dest_parent_id: str,
+        dest_parent_id: Optional[str],
+        dest_drive_id: str = "",
+        src_drive=None,
+        dst_drive=None,
     ) -> Dict:
-        """
-        Download into BytesIO, upload directly to destination.
-        Google Workspace files are exported first (same logic as migration_engine.py).
-        """
         empty      = {"success": False, "dest_id": None, "ignored": False, "error": None}
         last_error = ""
 
-        export_info  = GOOGLE_WORKSPACE_EXPORT.get(mime_type)
-        is_workspace = export_info is not None
+        _src = src_drive or self.source_drive
+        _dst = dst_drive or self.dest_drive
 
-        # Non-exportable workspace types (folder etc.)
         if mime_type == "application/vnd.google-apps.folder":
-            return {**empty, "ignored": True, "error": "Folder in file queue"}
+            return {**empty, "ignored": True, "error": "Folder in file queue",
+                    "error_type": "folder_in_queue"}
 
         for attempt in range(MAX_RETRIES):
             wait   = _backoff(attempt)
-            dl_buf = None
+            chunk  = _get_adaptive_chunk_size()   # FIX (v7): now returns real scaled sizes
+            dl_buf = None                          # FIX: reset at TOP of every attempt
             try:
-                # ── Download ─────────────────────────────────────────────────
-                if is_workspace:
-                    export_mime, ext, import_mime = export_info
-                    request   = self.source_drive.files().export_media(
-                        fileId=file_id, mimeType=export_mime
-                    )
-                    dest_name = file_name + ext
-                    up_mime   = export_mime
-                    dest_mime = import_mime   # re-import as Workspace type if possible
-                else:
-                    request   = self.source_drive.files().get_media(
-                        fileId=file_id, supportsAllDrives=True, acknowledgeAbuse=True
-                    )
-                    dest_name = file_name
-                    up_mime   = mime_type
-                    dest_mime = None
+                request   = _src.files().get_media(
+                    fileId=file_id, supportsAllDrives=True, acknowledgeAbuse=True
+                )
+                dest_name = file_name
+                up_mime   = mime_type
 
                 dl_buf = io.BytesIO()
                 try:
-                    dl   = MediaIoBaseDownload(dl_buf, request, chunksize=CHUNK_SIZE)
+                    dl   = MediaIoBaseDownload(dl_buf, request, chunksize=chunk)
                     done = False
                     while not done:
                         _, done = dl.next_chunk()
@@ -1047,26 +1831,29 @@ class SharedDriveMigrator:
 
                 if not data:
                     if file_size == 0:
-                        # Zero-byte file — create empty placeholder
-                        meta = {"name": dest_name, "parents": [dest_parent_id]}
-                        if dest_mime:
-                            meta["mimeType"] = dest_mime
-                        resp    = self.dest_drive.files().create(
+                        meta = {"name": dest_name}
+                        if dest_parent_id:
+                            meta["parents"] = [dest_parent_id]
+                        elif dest_drive_id:
+                            meta["parents"] = [dest_drive_id]
+                        resp    = _dst.files().create(
                             body=meta, fields="id", supportsAllDrives=True
                         ).execute()
-                        dest_id = resp.get("id")
+                        dest_id = _extract_id(resp)
                         self.stats["memory_routed"] += 1
                         return {**empty, "success": True, "dest_id": dest_id}
                     last_error = "Empty download for non-zero file"
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(wait)
                         continue
-                    return {**empty, "error": last_error}
+                    return {**empty, "error": last_error,
+                            "error_type": "empty_download"}
 
-                # ── Upload ───────────────────────────────────────────────────
-                meta = {"name": dest_name, "parents": [dest_parent_id]}
-                if dest_mime:
-                    meta["mimeType"] = dest_mime
+                meta = {"name": dest_name}
+                if dest_parent_id:
+                    meta["parents"] = [dest_parent_id]
+                elif dest_drive_id:
+                    meta["parents"] = [dest_drive_id]
 
                 upload_buf = io.BytesIO(data)
                 try:
@@ -1074,18 +1861,19 @@ class SharedDriveMigrator:
                     media = MediaIoBaseUpload(
                         upload_buf, mimetype=up_mime,
                         resumable=use_resumable,
-                        chunksize=CHUNK_SIZE if use_resumable else -1,
+                        chunksize=chunk if use_resumable else -1,
                     )
-                    resp = self.dest_drive.files().create(
+                    resp = _dst.files().create(
                         body=meta, media_body=media,
                         fields="id", supportsAllDrives=True,
                     ).execute()
                 finally:
                     upload_buf.close()
 
-                dest_id = resp.get("id") if isinstance(resp, dict) else None
+                dest_id = _extract_id(resp)
                 if dest_id is None:
-                    return {**empty, "error": f"Bad response: {resp!r}"}
+                    return {**empty, "error": f"Bad response: {resp!r}",
+                            "error_type": "bad_response"}
 
                 self.stats["memory_routed"] += 1
                 logger.debug(f"  [MEM] {file_name} ({_fmt_bytes(file_size)})")
@@ -1101,7 +1889,8 @@ class SharedDriveMigrator:
                         "cannotDownloadAbusiveFile", "exportSizeLimitExceeded",
                     )
                 ):
-                    return {**empty, "ignored": True, "error": "Download restricted"}
+                    return {**empty, "ignored": True, "error": "Download restricted",
+                            "error_type": "download_restricted"}
 
                 if code in (429, 500, 503) and attempt < MAX_RETRIES - 1:
                     logger.warning(
@@ -1112,7 +1901,7 @@ class SharedDriveMigrator:
                     continue
 
                 logger.error(f"  [MEM] HTTP {code} [{file_name}]: {last_error}")
-                return {**empty, "error": last_error}
+                return {**empty, "error": last_error, "error_type": f"http_{code}"}
 
             except (ConnectionResetError, ConnectionError, OSError, TimeoutError) as exc:
                 last_error = str(exc)
@@ -1130,7 +1919,7 @@ class SharedDriveMigrator:
                 logger.error(
                     f"  [MEM] Unexpected [{file_name}]: {last_error}", exc_info=True
                 )
-                return {**empty, "error": last_error}
+                return {**empty, "error": last_error, "error_type": "unexpected"}
 
             finally:
                 if dl_buf is not None:
@@ -1139,10 +1928,11 @@ class SharedDriveMigrator:
                     except Exception:
                         pass
 
-        return {**empty, "error": last_error}
+        return {**empty, "error": last_error, "error_type": "memory_transfer_failed"}
 
     # ─────────────────────────────────────────────────────────────────────────
-    # GCS path  (>= 50 MB)
+    # GCS path  (>= LARGE_FILE_THRESHOLD_BYTES)
+    # Hard per-file timeout (GCS_FILE_TIMEOUT seconds) on each attempt.
     # ─────────────────────────────────────────────────────────────────────────
 
     def _migrate_via_gcs(
@@ -1151,36 +1941,79 @@ class SharedDriveMigrator:
         file_name: str,
         mime_type: str,
         file_size: int,
-        dest_parent_id: str,
+        dest_parent_id: Optional[str],
+        dest_drive_id: str = "",
+        src_drive=None,
+        dst_drive=None,
     ) -> Dict:
-        """
-        Stream source → GCS → destination.
-        Uses mgr.download_drive_to_gcs() and mgr.upload_gcs_to_drive() —
-        the same helpers used by migration_engine.py.
-        """
         empty       = {"success": False, "dest_id": None, "ignored": False, "error": None}
         last_error  = ""
         active_blob = None
 
-        export_info = GOOGLE_WORKSPACE_EXPORT.get(mime_type)
-        export_mime = export_info[0] if export_info else None
-        import_mime = export_info[2] if export_info else None
-        dest_name   = (file_name + export_info[1]) if export_info else file_name
-        up_mime     = export_mime if export_info else mime_type
+        _src = src_drive or self.source_drive
+        _dst = dst_drive or self.dest_drive
+
+        export_info = GOOGLE_WORKSPACE_TYPES.get(mime_type)
+        # For GCS path, only binary files reach here (workspace files routed earlier)
+        # but keep the export logic as safety net.
+        if export_info and export_info.get("can_export"):
+            export_mime = export_info["export_mime"]
+            import_mime = export_info.get("import_mime")
+            dest_name   = file_name + export_info["extension"]
+            up_mime     = export_mime
+        else:
+            export_mime = None
+            import_mime = None
+            dest_name   = file_name
+            up_mime     = mime_type
 
         for attempt in range(MAX_RETRIES):
             wait         = _backoff(attempt)
             attempt_blob = f"{self.run_id}/{file_id}/attempt_{attempt}"
+            active_blob  = None
 
             try:
-                ok, blob_name, err = self.mgr.download_drive_to_gcs(
-                    drive_svc  = self.source_drive,
-                    file_id    = file_id,
-                    file_name  = file_name,
-                    run_id     = attempt_blob,
-                    mime_type  = up_mime,
-                    export_mime= export_mime,
-                )
+                # ── Download: Drive → GCS (with hard timeout) ─────────────────
+                # FIX-GCS-3: RuntimeError guard — if PM2 sends SIGTERM while
+                # this worker is mid-flight the outer pool's __exit__ begins
+                # interpreter teardown; sub_pool.submit() then raises
+                # RuntimeError "cannot schedule new futures after interpreter
+                # shutdown".  Catch it and return a clean failure so the outer
+                # pool drains without an unhandled exception in pm2 logs.
+                try:
+                    with _cf.ThreadPoolExecutor(max_workers=1) as sub_pool:
+                        dl_future = sub_pool.submit(
+                            self.mgr.download_drive_to_gcs,
+                            drive_svc   = _src,
+                            file_id     = file_id,
+                            file_name   = file_name,
+                            run_id      = attempt_blob,
+                            mime_type   = up_mime,
+                            export_mime = export_mime,
+                        )
+                        try:
+                            ok, blob_name, err = dl_future.result(timeout=GCS_FILE_TIMEOUT)
+                        except _cf.TimeoutError:
+                            last_error = (
+                                f"GCS download timed out after {GCS_FILE_TIMEOUT}s "
+                                f"[{_fmt_bytes(file_size)}]"
+                            )
+                            logger.warning(
+                                f"  [GCS] [{file_name}] attempt {attempt+1}: {last_error}"
+                            )
+                            if attempt < MAX_RETRIES - 1:
+                                time.sleep(wait)
+                                continue
+                            return {**empty, "error": last_error,
+                                    "error_type": "gcs_timeout"}
+                except RuntimeError as _shutdown_exc:
+                    # Interpreter is shutting down (PM2 restart / SIGKILL).
+                    logger.warning(
+                        f"  [GCS] Executor shutdown during download [{file_name}]: "
+                        f"{_shutdown_exc}"
+                    )
+                    return {**empty, "error": "Executor shutdown during GCS download",
+                            "error_type": "executor_shutdown"}
 
                 if not ok:
                     last_error = err or "GCS download failed"
@@ -1196,21 +2029,76 @@ class SharedDriveMigrator:
                         )
                         time.sleep(wait)
                         continue
-                    return {**empty, "error": last_error}
+                    return {**empty, "error": last_error,
+                            "error_type": "gcs_download_failed"}
 
                 active_blob = blob_name
 
-                ok2, dest_id, err2 = self.mgr.upload_gcs_to_drive(
-                    drive_svc  = self.dest_drive,
-                    blob_name  = blob_name,
-                    file_name  = dest_name,
-                    mime_type  = up_mime,
-                    parent_id  = dest_parent_id,
-                    import_mime= import_mime,
-                )
+                # ── Upload: GCS → Drive (with hard timeout) ───────────────────
+                # FIX-GCS-1: consume one token before initiating the resumable
+                # upload.  All 14 worker threads share _GCS_UPLOAD_BUCKET so
+                # the project-wide rate stays at _GCS_UPLOAD_RATE/s regardless
+                # of thread count — prevents userRateLimitExceeded 403 storms.
+                _GCS_UPLOAD_BUCKET.consume()
+
+                # FIX-GCS-3: RuntimeError guard (same reason as download block).
+                try:
+                    with _cf.ThreadPoolExecutor(max_workers=1) as sub_pool:
+                        ul_future = sub_pool.submit(
+                            self.mgr.upload_gcs_to_drive,
+                            drive_svc   = _dst,
+                            blob_name   = blob_name,
+                            file_name   = dest_name,
+                            mime_type   = up_mime,
+                            parent_id   = dest_parent_id,   # None when at drive root
+                            import_mime = import_mime,
+                            drive_id    = dest_drive_id,    # used in URL when parent_id is None
+                        )
+                        try:
+                            ok2, dest_id, err2 = ul_future.result(timeout=GCS_FILE_TIMEOUT)
+                        except _cf.TimeoutError:
+                            last_error = (
+                                f"GCS upload timed out after {GCS_FILE_TIMEOUT}s "
+                                f"[{_fmt_bytes(file_size)}]"
+                            )
+                            logger.warning(
+                                f"  [GCS] [{file_name}] attempt {attempt+1}: {last_error}"
+                            )
+                            if active_blob:
+                                try:
+                                    self.mgr.delete_temp(active_blob)
+                                except Exception:
+                                    pass
+                                active_blob = None
+                            if attempt < MAX_RETRIES - 1:
+                                time.sleep(wait)
+                                continue
+                            return {**empty, "error": last_error,
+                                    "error_type": "gcs_timeout"}
+                except RuntimeError as _shutdown_exc:
+                    # Interpreter is shutting down (PM2 restart / SIGKILL).
+                    logger.warning(
+                        f"  [GCS] Executor shutdown during upload [{file_name}]: "
+                        f"{_shutdown_exc}"
+                    )
+                    if active_blob is not None:
+                        try:
+                            self.mgr.delete_temp(active_blob)
+                        except Exception:
+                            pass
+                    return {**empty, "error": "Executor shutdown during GCS upload",
+                            "error_type": "executor_shutdown"}
 
                 if not ok2:
                     last_error = err2 or "GCS upload failed"
+                    # FIX-GCS-2: 403 userRateLimitExceeded means the quota window
+                    # is full — double the retry wait so it has time to drain before
+                    # the next attempt, instead of hammering it again immediately.
+                    _is_rate_limited = (
+                        "userRateLimitExceeded" in (last_error or "")
+                        or "User rate limit exceeded" in (last_error or "")
+                        or "userRateLimitExceeded" in (err2 or "")
+                    )
                     if active_blob is not None:
                         try:
                             self.mgr.delete_temp(active_blob)
@@ -1218,15 +2106,18 @@ class SharedDriveMigrator:
                             pass
                         active_blob = None
                     if attempt < MAX_RETRIES - 1:
+                        retry_wait = wait * 2 if _is_rate_limited else wait
                         logger.warning(
                             f"  [GCS] Upload failed {attempt+1}/{MAX_RETRIES}"
-                            f" [{file_name}]: {last_error} — retry {wait:.1f}s"
+                            f" [{file_name}]: {last_error} — "
+                            f"{'rate-limit; ' if _is_rate_limited else ''}"
+                            f"retry {retry_wait:.1f}s"
                         )
-                        time.sleep(wait)
+                        time.sleep(retry_wait)
                         continue
-                    return {**empty, "error": last_error}
+                    return {**empty, "error": last_error,
+                            "error_type": "gcs_upload_failed"}
 
-                # Success — clean up staging blob
                 if active_blob is not None:
                     try:
                         self.mgr.delete_temp(active_blob)
@@ -1275,43 +2166,18 @@ class SharedDriveMigrator:
             except Exception:
                 pass
 
-        return {**empty, "error": last_error}
+        return {**empty, "error": last_error, "error_type": "gcs_transfer_failed"}
 
     # =========================================================================
-    # MAIN: Migrate all (or filtered) Shared Drives — two-phase + temp membership
+    # MAIN: Migrate all (or filtered) Shared Drives
     # =========================================================================
 
     def migrate_all_shared_drives(
         self,
         drive_filter: List[str] = None,
         drive_id_mapping: Dict[str, str] = None,
+        resume: bool = False,
     ) -> Dict:
-        """
-        Main entry point for Shared Drive migration.
-
-        v4 change — Temporary Admin Membership:
-          For EACH drive triple (src_id, dst_id, drive_name):
-            1. _ensure_admin_access(src_id, drive_name) is called BEFORE any
-               Drive API calls against that drive.
-            2. If the admin was added temporarily (was_temporary=True), the
-               permission_id is stored in `temp_perms`.
-            3. After migration of that drive finishes (success OR failure),
-               _revoke_admin_access() is called inside a `finally` block.
-          File-level permissions are NEVER modified during this process.
-
-        Phase 1 — Discovery (parallel per drive):
-          • List files, register in SQL, build folder hierarchy.
-
-        Phase 2 — Global queue (flat GLOBAL_WORKERS pool):
-          • Drain all PENDING/FAILED files from SQL across every drive.
-          • Route each file to memory (<50 MB) or GCS (>=50 MB).
-          • Apply file-level permissions after each successful upload.
-
-        Args:
-            drive_filter     : optional list of drive names (None = all).
-                               Ignored when drive_id_mapping is provided.
-            drive_id_mapping : optional {source_drive_id: dest_drive_id} from CSV.
-        """
         summary = {
             "total_drives":             0,
             "drives_migrated":          0,
@@ -1322,11 +2188,11 @@ class SharedDriveMigrator:
             "total_files_skipped":      0,
             "total_folders_created":    0,
             "total_members_migrated":   0,
-            "total_temp_memberships":   0,   # NEW: count of drives needing temp access
+            "total_temp_memberships":   0,
             "drive_results":            [],
         }
 
-        # ── Resolve the list of (src_id, dst_id, drive_name) triples ─────────
+        # ── Resolve drive triples ─────────────────────────────────────────────
         drive_triples: List[Tuple[str, str, str]] = []
 
         if drive_id_mapping:
@@ -1386,39 +2252,104 @@ class SharedDriveMigrator:
             logger.warning("No drives available for migration after setup.")
             return summary
 
-        # ── NEW v4: Ensure admin access for each source drive ─────────────────
-        # temp_perms maps src_id → permission_id (or None if no temp perm needed)
-        # We resolve membership BEFORE any per-drive work starts.
-        # Cleanup (revocation) happens in a per-drive finally block below.
-        temp_perms: Dict[str, Optional[str]] = {}
+        # ── Ensure SOURCE admin access (PERF-4: parallel, was serial for-loop) ──
+        temp_perms: Dict[str, Optional[str]] = {}       # src_id → perm_id (None = pre-existing)
+        temp_perms_lock = threading.Lock()
+
+        # ── Ensure DESTINATION admin access (TEMPORARY — mirrors CloudM behaviour) ──
+        # Tracks: whether admin was pre-existing, original role, and new perm_id to revoke.
+        # Structure per dst_id: {"was_temp": bool, "perm_id": str|None, "original_role": str|None}
+        dest_temp_perms: Dict[str, Dict] = {}
+        dest_temp_perms_lock = threading.Lock()
 
         logger.info(
-            f"[TEMP-MEMBERSHIP] Checking admin membership for "
-            f"{len(drive_triples)} source drive(s)..."
+            f"[SRC-MEMBERSHIP] Checking source admin membership for "
+            f"{len(drive_triples)} source drive(s) "
+            f"({min(PREFLIGHT_WORKERS, len(drive_triples))} workers)..."
         )
-        for src_id, dst_id, drive_name in drive_triples:
+        logger.info(
+            f"[DEST-MEMBERSHIP] Checking destination admin membership for "
+            f"{len(drive_triples)} destination drive(s) "
+            f"({min(PREFLIGHT_WORKERS, len(drive_triples))} workers)..."
+        )
+
+        def _preflight_one(triple):
+            src_id, dst_id, drive_name = triple
+            # Source admin (existing logic)
             was_temp, perm_id = self._ensure_admin_access(src_id, drive_name)
-            temp_perms[src_id] = perm_id if was_temp else None
+            with temp_perms_lock:
+                temp_perms[src_id] = perm_id if was_temp else None
+            # Destination admin (new: temporary access)
+            d_was_temp, d_perm_id, d_orig_role = self._ensure_dest_admin_organizer(
+                dst_id, drive_name
+            )
+            with dest_temp_perms_lock:
+                dest_temp_perms[dst_id] = {
+                    "was_temp":      d_was_temp,
+                    "perm_id":       d_perm_id,
+                    "original_role": d_orig_role,
+                }
+
+        with ThreadPoolExecutor(max_workers=min(PREFLIGHT_WORKERS, len(drive_triples))) as pool:
+            # Use submit+as_completed instead of pool.map so a single drive failure
+            # does NOT abort the remaining preflight tasks (pool.map re-raises on
+            # first exception, blocking all other drives from getting access).
+            _pf_futures = {pool.submit(_preflight_one, t): t for t in drive_triples}
+            for _pf_f in as_completed(_pf_futures):
+                try:
+                    _pf_f.result()
+                except Exception as _pf_exc:
+                    _t = _pf_futures[_pf_f]
+                    logger.warning(
+                        f"[PREFLIGHT] Drive '{_t[2]}' preflight error "
+                        f"(non-fatal, migration continues): {_pf_exc}"
+                    )
 
         temp_count = sum(1 for p in temp_perms.values() if p is not None)
+        dest_temp_count = sum(
+            1 for d in dest_temp_perms.values() if d.get("was_temp")
+        )
         summary["total_temp_memberships"] = temp_count
         if temp_count:
             logger.info(
-                f"[TEMP-MEMBERSHIP] Temporary access granted for {temp_count} drive(s). "
-                "Will revoke after each drive completes."
+                f"[SRC-MEMBERSHIP] Temporary manager access granted for "
+                f"{temp_count} source drive(s). Will revoke after migration."
+            )
+        if dest_temp_count:
+            logger.info(
+                f"[DEST-MEMBERSHIP] Temporary organizer access granted for "
+                f"{dest_temp_count} destination drive(s). Will revoke after migration."
             )
 
-        # ── Step: migrate drive-level members for all drives (serial) ─────────
-        # Done before Phase 1 so members exist before any file permissions land.
+        # ── Migrate drive-level members (PERF-5: parallel, was serial for-loop) ──
         member_results: Dict[str, Dict] = {}
-        for src_id, dst_id, drive_name in drive_triples:
+        member_results_lock = threading.Lock()
+        member_stats_delta  = [0]  # accumulated migrated count, updated under lock
+
+        def _migrate_members_one(triple):
+            src_id, dst_id, drive_name = triple
             self.mgr.upsert_shared_drive(self.run_id, src_id, drive_name)
             mr = self.migrate_drive_members(src_id, dst_id, drive_name)
-            member_results[src_id] = mr
-            self.stats["members_migrated"] += mr.get("migrated", 0)
-            summary["total_members_migrated"] += mr.get("migrated", 0)
+            with member_results_lock:
+                member_results[src_id]     = mr
+                member_stats_delta[0]     += mr.get("migrated", 0)
 
-        # ── PHASE 1: Parallel discovery + folder creation ──────────────────────
+        with ThreadPoolExecutor(max_workers=min(MEMBER_WORKERS, len(drive_triples))) as pool:
+            _mb_futures = {pool.submit(_migrate_members_one, t): t for t in drive_triples}
+            for _mb_f in as_completed(_mb_futures):
+                try:
+                    _mb_f.result()
+                except Exception as _mb_exc:
+                    _t = _mb_futures[_mb_f]
+                    logger.warning(
+                        f"[MEMBER-MIGRATE] Drive '{_t[2]}' member migration error "
+                        f"(non-fatal): {_mb_exc}"
+                    )
+
+        self.stats["members_migrated"]        = member_stats_delta[0]
+        summary["total_members_migrated"]     = member_stats_delta[0]
+
+        # ── PHASE 1: Parallel discovery + folder creation ─────────────────────
         logger.info(
             f"[PHASE-1] Discovering {len(drive_triples)} drives "
             f"with {min(DISCOVERY_WORKERS, len(drive_triples))} workers..."
@@ -1449,84 +2380,183 @@ class SharedDriveMigrator:
                         exc_info=True,
                     )
                     disc_results[src_id] = {
-                        "status": "discovery_failed",
-                        "error":  str(exc),
+                        "status":    "discovery_failed",
+                        "error":     str(exc),
                         "source_id": src_id,
                         "dest_id":   dst_id,
                         "name":      drive_name,
                     }
 
-        # ── PHASE 2: Global file queue ─────────────────────────────────────────
+        # ── PHASE 2: Reset IN_PROGRESS rows left by a previous crash ─────────
+        try:
+            _reset_conn = self.mgr.get_conn()
+            try:
+                _reset_cur = _reset_conn.cursor()
+                _reset_cur.execute(
+                    "UPDATE migration_items "
+                    "SET status='PENDING', error_message=NULL "
+                    "WHERE migration_id=%s AND status='IN_PROGRESS' AND is_folder=0",
+                    (self.run_id,),
+                )
+                _reset_n = _reset_cur.rowcount
+                _reset_conn.commit()
+                if _reset_n:
+                    logger.warning(
+                        f"[PHASE-2] Reset {_reset_n} IN_PROGRESS→PENDING for "
+                        f"run_id={self.run_id} (leftover from previous crashed attempt)"
+                    )
+            finally:
+                try:
+                    _reset_conn.close()
+                except Exception:
+                    pass
+        except Exception as _reset_exc:
+            logger.warning(f"[PHASE-2] IN_PROGRESS reset failed (safe fallback): {_reset_exc}")
+
+        # ── PHASE 2: XL-first two-pass queue ─────────────────────────────────
         pending = self.mgr.get_all_pending_items(self.run_id)
-        # Sort smallest-first so fast files don't queue behind large ones
-        pending.sort(key=lambda r: int(getattr(r, "file_size_bytes", None) or 0))
-        logger.info(
-            f"[PHASE-2] Global queue — {len(pending)} files, "
-            f"{GLOBAL_WORKERS} workers..."
+
+        # FIX (v7): Sort largest-first before the XL/regular split so XL jobs
+        # start immediately — mirrors migration_engine_v4's sort() call.
+        pending.sort(
+            key=lambda r: int(getattr(r, "file_size_bytes", None) or 0),
+            reverse=True,
         )
 
-        # {file_id: result_dict}
+        xl_items  = [r for r in pending
+                     if int(getattr(r, "file_size_bytes", None) or 0) >= XLARGE_FILE_THRESHOLD_BYTES]
+        reg_items = [r for r in pending
+                     if int(getattr(r, "file_size_bytes", None) or 0) <  XLARGE_FILE_THRESHOLD_BYTES]
+
+        logger.info(
+            f"[PHASE-2] {len(pending)} files pending | "
+            f"XL(>{XLARGE_FILE_THRESHOLD_BYTES // (1024*1024)} MB): "
+            f"{len(xl_items)} × {XLARGE_WORKERS} workers | "
+            f"regular: {len(reg_items)} × {GLOBAL_WORKERS} workers"
+        )
+
         file_results: Dict[str, Dict] = {}
+        file_results_lock = threading.Lock()
+        done_count = [0]
 
-        with ThreadPoolExecutor(max_workers=GLOBAL_WORKERS) as pool:
-            futures = {
-                pool.submit(self._process_queue_item, item): item
-                for item in pending
-            }
-            done = 0
-            for future in as_completed(futures):
-                item = futures[future]
-                try:
-                    res = future.result()
-                    file_results[item.file_id] = res
-                    done += 1
-                    if done % 50 == 0:
-                        logger.info(
-                            f"[PHASE-2] Progress: {done}/{len(pending)}"
+        def _drain(items: list, max_workers: int, label: str):
+            if not items:
+                return
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(self._process_queue_item, item): item
+                    for item in items
+                }
+                for future in as_completed(futures):
+                    item = futures[future]
+                    try:
+                        res = future.result()
+                        with file_results_lock:
+                            file_results[item.file_id] = res
+                            done_count[0] += 1
+                            if done_count[0] % 50 == 0:
+                                logger.info(
+                                    f"[PHASE-2/{label}] "
+                                    f"{done_count[0]}/{len(pending)} complete"
+                                )
+                    except Exception as exc:
+                        logger.error(
+                            f"[PHASE-2/{label}] Future error [{item.file_name}]: {exc}",
+                            exc_info=True,
                         )
-                except Exception as exc:
-                    logger.error(
-                        f"[PHASE-2] Future error [{item.file_name}]: {exc}",
-                        exc_info=True,
-                    )
-                    file_results[item.file_id] = {
-                        "success": False, "error": str(exc),
-                        "source_drive_id": getattr(
-                            item, "source_shared_drive_id", ""
-                        ),
-                    }
+                        with file_results_lock:
+                            file_results[item.file_id] = {
+                                "success":         False,
+                                "error":           str(exc),
+                                "error_type":      "future_error",
+                                "source_drive_id": getattr(
+                                    item, "source_shared_drive_id", ""
+                                ),
+                            }
 
-        # ── NEW v4: Revoke temporary admin permissions ────────────────────────
-        # Done AFTER Phase 2 so admin access is present for the entire migration.
-        # Each revocation is wrapped in try/finally so one failure does not
-        # prevent the others from running.
-        logger.info("[TEMP-MEMBERSHIP] Revoking temporary drive memberships...")
-        for src_id, dst_id, drive_name in drive_triples:
+        # Pass 1: XL files first with dedicated pool (blocks until all XL done)
+        if xl_items:
+            logger.info(
+                f"[PHASE-2/XL] Starting {len(xl_items)} XL files "
+                f"({XLARGE_WORKERS} workers)..."
+            )
+            _drain(xl_items, XLARGE_WORKERS, "XL")
+            logger.info(
+                f"[PHASE-2/XL] All XL files finished — "
+                f"switching to full {GLOBAL_WORKERS}-worker pool"
+            )
+
+        # Pass 2: remaining files with full pool
+        _drain(reg_items, GLOBAL_WORKERS, "REG")
+
+        # ── Post-migration cleanup (PERF-6: both loops merged + parallelised) ──
+        # Cleanup covers THREE actions per drive:
+        #   1. Revoke DESTINATION admin temp organizer (if we added it; skip if pre-existing)
+        #   2. Revoke SOURCE admin temp manager        (existing behaviour)
+        # Both run in parallel across drives.
+        logger.info(
+            "[CLEANUP] Revoking temporary source + destination admin access "
+            f"({min(CLEANUP_WORKERS, len(drive_triples))} workers)..."
+        )
+
+        def _cleanup_one(triple):
+            src_id, dst_id, drive_name = triple
+
+            # ── Revoke destination admin temp organizer (if we added it) ──────
+            d_info = dest_temp_perms.get(dst_id, {})
+            if d_info.get("was_temp") and d_info.get("perm_id"):
+                try:
+                    self._revoke_dest_admin_access(dst_id, drive_name, d_info["perm_id"])
+                except Exception as exc:
+                    logger.warning(
+                        f"[CLEANUP] dest temp organizer revoke failed for "
+                        f"'{drive_name}': {exc}"
+                    )
+            elif not d_info.get("was_temp") and d_info.get("original_role"):
+                logger.debug(
+                    f"[CLEANUP] Dest admin was pre-existing on '{drive_name}' "
+                    f"(role='{d_info['original_role']}') — not revoking."
+                )
+
+            # ── Revoke source admin temp manager ─────────────────────────────
             perm_id = temp_perms.get(src_id)
             if perm_id:
                 try:
                     self._revoke_admin_access(src_id, drive_name, perm_id)
                 except Exception as exc:
-                    # Already logged inside _revoke_admin_access; belt-and-suspenders.
                     logger.warning(
-                        f"[TEMP-MEMBERSHIP] Revocation outer exception for "
-                        f"'{drive_name}': {exc}"
+                        f"[CLEANUP] source revoke failed for '{drive_name}': {exc}"
+                    )
+
+        with ThreadPoolExecutor(max_workers=min(CLEANUP_WORKERS, len(drive_triples))) as pool:
+            _cl_futures = {pool.submit(_cleanup_one, t): t for t in drive_triples}
+            for _cl_f in as_completed(_cl_futures):
+                try:
+                    _cl_f.result()
+                except Exception as _cl_exc:
+                    _t = _cl_futures[_cl_f]
+                    logger.warning(
+                        f"[CLEANUP] Drive '{_t[2]}' cleanup error "
+                        f"(non-fatal, check permissions manually): {_cl_exc}"
                     )
 
         # ── Aggregate results per drive ────────────────────────────────────────
         per_drive: Dict[str, Dict] = {
             src_id: {
-                "name":             drive_name,
-                "source_id":        src_id,
-                "dest_id":          dst_id,
-                "status":           "failed",
-                "files_migrated":   0,
-                "files_failed":     0,
-                "files_skipped":    0,
-                "files_ignored":    0,
-                "folders_created":  disc_results.get(src_id, {}).get("folders_created", 0),
-                "members_migrated": member_results.get(src_id, {}).get("migrated", 0),
-                "temp_membership":  temp_perms.get(src_id) is not None,   # NEW
+                "name":                    drive_name,
+                "source_id":               src_id,
+                "dest_id":                 dst_id,
+                "status":                  "failed",
+                "files_migrated":          0,
+                "files_failed":            0,
+                "files_skipped":           0,
+                "files_ignored":           0,
+                "folders_created":         disc_results.get(src_id, {}).get("folders_created", 0),
+                "members_migrated":        member_results.get(src_id, {}).get("migrated", 0),
+                "src_temp_manager":        temp_perms.get(src_id) is not None,
+                "dest_temp_organizer":     dest_temp_perms.get(dst_id, {}).get("was_temp", False),
+                "dest_admin_pre_existing": not dest_temp_perms.get(dst_id, {}).get("was_temp", False)
+                                           and dest_temp_perms.get(dst_id, {}).get("original_role") is not None,
             }
             for src_id, dst_id, drive_name in drive_triples
         }
@@ -1577,10 +2607,12 @@ class SharedDriveMigrator:
             summary["total_folders_created"] += agg["folders_created"]
             summary["drive_results"].append(agg)
 
-            icon = "✓" if agg["status"] == "completed" else "✗"
-            temp_tag = " [temp-member]" if agg.get("temp_membership") else ""
+            icon     = "✓" if agg["status"] == "completed" else "✗"
+            src_tag  = " [src-temp-manager]"       if agg.get("src_temp_manager")        else ""
+            dst_tag  = " [dest-temp-organizer]"    if agg.get("dest_temp_organizer")     else ""
+            pre_tag  = " [dest-admin-pre-existing]" if agg.get("dest_admin_pre_existing") else ""
             logger.info(
-                f"  {icon} {agg['name']} ({src_id}){temp_tag}: "
+                f"  {icon} {agg['name']} ({src_id}){src_tag}{dst_tag}{pre_tag}: "
                 f"{agg['files_migrated']} migrated | "
                 f"{agg['files_failed']} failed | "
                 f"{agg['folders_created']} folders | "
@@ -1593,7 +2625,11 @@ class SharedDriveMigrator:
             f"files={summary['total_files_migrated']} migrated, "
             f"{summary['total_files_failed']} failed | "
             f"GCS={self.stats['gcs_routed']} MEM={self.stats['memory_routed']} | "
-            f"temp_memberships_used={summary['total_temp_memberships']}"
+            f"src_temp_managers_used={summary['total_temp_memberships']} | "
+            f"dest_temp_organizers_added={dest_temp_count} | "
+            f"dest_temp_organizers_revoked={dest_temp_count} | "
+            f"[PERF-8] perms_skipped_inherited={self.stats['perms_skipped_inherited']} "
+            f"perms_explicit_migrated={self.stats['perms_explicit_migrated']}"
         )
 
         return summary
@@ -1608,17 +2644,65 @@ class SharedDriveMigrator:
         drive_name: str,
         source_drive_id: str,
     ) -> Optional[str]:
-        try:
-            self.dest_drive.drives().get(driveId=dest_drive_id).execute()
-            logger.debug(f"Dest drive {dest_drive_id} accessible")
-            return dest_drive_id
-        except Exception as exc:
-            code = getattr(getattr(exc, "resp", None), "status", None)
-            if code == 404:
+        """
+        Verify the pre-mapped destination Shared Drive is accessible.
+
+        BUG-FIX (v10): In ID-mapped mode (drive_id_mapping CSV) this method
+        must NEVER create a new Shared Drive.  The previous code called
+        create_dest_shared_drive() on any 404, which silently created a brand-
+        new drive named after the SOURCE drive (e.g. 'z') instead of writing
+        into the already-existing destination drive ('hemant').
+
+        Root causes fixed:
+          1. drives().get() was called WITHOUT useDomainAdminAccess=True so the
+             dest service account got a 403/404 even when the drive existed,
+             triggering the spurious creation.
+          2. On any error the old code created; now it only logs + returns None.
+        """
+        # Try with admin access first, then without (some SA setups reject the flag)
+        for use_admin in (True, False):
+            try:
+                kwargs = {"driveId": dest_drive_id, "fields": "id,name"}
+                if use_admin:
+                    kwargs["useDomainAdminAccess"] = True
+                meta = self.dest_drive.drives().get(**kwargs).execute()
+                actual_name = meta.get("name", dest_drive_id)
                 logger.info(
-                    f"Dest drive {dest_drive_id} not found — "
-                    f"creating '{drive_name}' in dest domain"
+                    f"[DEST-VERIFY] ✓ Destination drive accessible: "
+                    f"'{actual_name}' ({dest_drive_id}) "
+                    f"← source='{drive_name}' | useDomainAdminAccess={use_admin}"
                 )
-                return self.create_dest_shared_drive(drive_name, source_drive_id)
-            logger.error(f"Cannot access dest drive {dest_drive_id}: {exc}")
-            return None
+                return dest_drive_id
+
+            except HttpError as exc:
+                code = exc.resp.status
+                if code == 400 and use_admin:
+                    # SA doesn't support useDomainAdminAccess on drives.get — retry without
+                    logger.debug(
+                        f"[DEST-VERIFY] drives.get useDomainAdminAccess=True → 400 "
+                        f"for {dest_drive_id}, retrying without flag"
+                    )
+                    continue
+                if code == 404:
+                    logger.error(
+                        f"[DEST-VERIFY] ✗ Destination drive NOT FOUND: {dest_drive_id} "
+                        f"(mapped destination for source '{drive_name}'). "
+                        "Verify your drive_id_mapping CSV — the destination ID must "
+                        "already exist in the destination Google Workspace domain. "
+                        "This migration will SKIP this drive pair."
+                    )
+                    return None   # BUG-FIX: never create — only use the mapped drive
+                logger.error(
+                    f"[DEST-VERIFY] Cannot access dest drive {dest_drive_id} "
+                    f"HTTP {code}: {exc}"
+                )
+                return None
+
+            except Exception as exc:
+                logger.error(
+                    f"[DEST-VERIFY] Unexpected error accessing dest drive "
+                    f"{dest_drive_id}: {exc}"
+                )
+                return None
+
+        return None
